@@ -273,6 +273,7 @@ ifeq ($(SETUP), mydisc)
     MULTIRUNFILE= multirun.f90
     IND_TIMESTEPS=yes
     STORE_TEMP=yes
+		HDF5=yes
     #no capital 'YES'
 endif
 
@@ -1691,7 +1692,7 @@ endif
 #
 ifeq ($(HDF5), yes)
 ifeq (X$(HDF5ROOT), X)
-    HDF5ROOT= /usr/local/opt/hdf5
+    HDF5ROOT= /opt/local
 endif
 ifeq (X$(HDF5INCLUDE), X)
     HDF5INCLUDE= $(HDF5ROOT)/include
