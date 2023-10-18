@@ -1,10 +1,10 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
-module domain
+module mpidomain
 !
 ! This module performs the MPI domain decomposition
 !   Since we now do the decomposition using the tree all this
@@ -22,8 +22,6 @@ module domain
  use io,  only:nprocs
  use part, only:ibelong
  implicit none
- character(len=80), parameter, public :: &  ! module version
-    modid="$Id$"
 
  integer, parameter :: ndim = 3
 
@@ -65,14 +63,15 @@ end subroutine init_domains
 !+
 !-----------------------------------------------------------------------
 integer function assign_to_domain(i,id)
+ use dim, only: mpi
  integer(kind=8), intent(in) :: i
  integer,         intent(in) :: id
 
-#ifdef MPI
- assign_to_domain = int(mod(i,int(nprocs,kind=8)),kind=kind(assign_to_domain))
-#else
- assign_to_domain = id
-#endif
+ if (mpi) then
+    assign_to_domain = int(mod(i,int(nprocs,kind=8)),kind=kind(assign_to_domain))
+ else
+    assign_to_domain = id
+ endif
 
 end function assign_to_domain
 
@@ -91,4 +90,4 @@ logical function i_belong(iparttot)
 
 end function i_belong
 
-end module domain
+end module mpidomain

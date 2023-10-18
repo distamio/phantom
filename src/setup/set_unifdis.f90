@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module unifdis
 !
@@ -19,7 +19,7 @@ module unifdis
  use stretchmap, only:rho_func
  implicit none
  public :: set_unifdis, get_ny_nz_closepacked, get_xyzmin_xyzmax_exact
- public :: is_valid_lattice, is_closepacked
+ public :: is_valid_lattice, is_closepacked, latticetype
 
  ! following lines of code allow an optional mask= argument
  ! to setup only certain subsets of the particle domain (used for MPI)
@@ -28,6 +28,11 @@ module unifdis
    integer(kind=8), intent(in) :: ip
   end function mask_prototype
  end interface
+
+ integer, parameter, public :: i_cubic       = 1, &
+                               i_closepacked = 2, &
+                               i_hexagonal   = 3, &
+                               i_random      = 4
 
  public :: mask_prototype, mask_true, rho_func
 
@@ -48,10 +53,10 @@ contains
 subroutine set_unifdis(lattice,id,master,xmin,xmax,ymin,ymax, &
                        zmin,zmax,delta,hfact,np,xyzh,periodic, &
                        rmin,rmax,rcylmin,rcylmax,rellipsoid,in_ellipsoid, &
-                       nptot,npy,npz,rhofunc,inputiseed,verbose,centre,dir,geom,mask,err)
+                       nptot,npy,npz,npnew_in,rhofunc,inputiseed,verbose,centre,dir,geom,mask,err)
  use random,     only:ran2
  use stretchmap, only:set_density_profile
- !use domain,     only:i_belong
+ !use mpidomain,  only:i_belong
  character(len=*), intent(in)    :: lattice
  integer,          intent(in)    :: id,master
  integer,          intent(inout) :: np
@@ -63,7 +68,7 @@ subroutine set_unifdis(lattice,id,master,xmin,xmax,ymin,ymax, &
  real,             intent(in),    optional :: rcylmin,rcylmax
  real,             intent(in),    optional :: rellipsoid(3)
  integer(kind=8),  intent(inout), optional :: nptot
- integer,          intent(in),    optional :: npy,npz,dir,geom
+ integer,          intent(in),    optional :: npy,npz,npnew_in,dir,geom
  procedure(rho_func), pointer,    optional :: rhofunc
  integer,          intent(in),    optional :: inputiseed
  logical,          intent(in),    optional :: verbose,centre,in_ellipsoid
@@ -201,7 +206,7 @@ subroutine set_unifdis(lattice,id,master,xmin,xmax,ymin,ymax, &
                 iparttot = iparttot + 1
                 if (i_belong(iparttot)) then
                    ipart = ipart + 1
-                   if (ipart > maxp) stop 'ipart > maxp: re-compile with MAXP=bigger number'
+                   if (ipart > maxp) stop 'ipart > maxp: use ./phantomsetup --maxp=10000000'
                    xyzh(1,ipart) = xi
                    xyzh(2,ipart) = yi
                    xyzh(3,ipart) = zi
@@ -521,6 +526,7 @@ subroutine set_unifdis(lattice,id,master,xmin,xmax,ymin,ymax, &
     ny = nint(dybound/delta)
     nz = nint(dzbound/delta)
     npnew = nx*ny*nz
+    if (present(npnew_in)) npnew = npnew_in
 
     do while (iparttot < iparttot0+npnew)
        xi = xmin + ran2(iseed)*dxbound
@@ -685,17 +691,17 @@ pure subroutine get_xyzmin_xyzmax_exact(latticetype,xmin,xmax,ymin,ymax,zmin,zma
 
  ! adjust boundaries as required
  exact_width = nx*deltax
- dbounds     = abs(boxx - exact_width)
+ dbounds     = exact_width - boxx
  xmin = xmin - 0.5*dbounds
  xmax = xmax + 0.5*dbounds
 
  exact_width = ny*deltay
- dbounds     = abs(boxy - exact_width)
+ dbounds     = exact_width - boxy
  ymin = ymin - 0.5*dbounds
  ymax = ymax + 0.5*dbounds
 
  exact_width = nz*deltaz
- dbounds     = abs(boxz - exact_width)
+ dbounds     = exact_width - boxz
  zmin = zmin - 0.5*dbounds
  zmax = zmax + 0.5*dbounds
 
@@ -716,6 +722,29 @@ pure logical function is_valid_lattice(latticetype)
  end select
 
 end function is_valid_lattice
+
+!-------------------------------------------------------------
+!+
+!  utility function to give correct lattice string
+!  given integer lattice choice
+!+
+!-------------------------------------------------------------
+function latticetype(ilattice)
+ integer, intent(in) :: ilattice
+ character(len=11) :: latticetype
+
+ select case(ilattice)
+ case(i_random)
+    latticetype = 'random'
+ case(i_hexagonal)
+    latticetype = 'hexagonal'
+ case(i_closepacked)
+    latticetype = 'closepacked'
+ case default
+    latticetype = 'cubic'
+ end select
+
+end function latticetype
 
 !---------------------------------------------------------------
 !+

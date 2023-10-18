@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module initial
 !
@@ -14,18 +14,17 @@ module initial
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: analysis, balance, boundary, centreofmass, checkconserved,
-!   checkoptions, checksetup, cons2prim, cooling, cpuinfo, densityforce,
-!   deriv, dim, domain, dust, energies, eos, evwrite, extern_gr,
-!   externalforces, fastmath, fileutils, forcing, growth, inject, io,
-!   io_summary, krome_interface, linklist, metric_tools, mf_write, mpi,
-!   mpiderivs, mpiutils, nicil, nicil_sup, omputils, options, part,
-!   photoevap, ptmass, radiation_utils, readwrite_dumps, readwrite_infile,
-!   stack, timestep, timestep_ind, timestep_sts, timing, units, writeheader
+! :Dependencies: analysis, boundary, boundary_dyn, centreofmass,
+!   checkconserved, checkoptions, checksetup, cons2prim, cooling, cpuinfo,
+!   damping, densityforce, deriv, dim, dust, dust_formation, energies, eos,
+!   evwrite, extern_gr, externalforces, fastmath, fileutils, forcing,
+!   growth, inject, io, io_summary, krome_interface, linklist,
+!   metric_tools, mf_write, mpibalance, mpidomain, mpimemory, mpitree,
+!   mpiutils, nicil, nicil_sup, omputils, options, part, partinject,
+!   ptmass, radiation_utils, readwrite_dumps, readwrite_infile, timestep,
+!   timestep_ind, timestep_sts, timing, units, writeheader
 !
-#ifdef MPI
- use mpi
-#endif
+
  implicit none
  public :: initialise,finalise,startrun,endrun
  real(kind=4), private :: twall_start, tcpu_start
@@ -41,6 +40,7 @@ contains
 !+
 !----------------------------------------------------------------
 subroutine initialise()
+ use dim,              only:mpi
  use io,               only:fatal,die,id,master,nprocs,ievfile
 #ifdef FINVSQRT
  use fastmath,         only:testsqrt
@@ -51,13 +51,9 @@ subroutine initialise()
  use boundary,         only:set_boundary
  use writeheader,      only:write_codeinfo
  use evwrite,          only:init_evfile
- use domain,           only:init_domains
+ use mpidomain,        only:init_domains
  use cpuinfo,          only:print_cpuinfo
  use checkoptions,     only:check_compile_time_settings
-#ifdef MPI
- use mpiderivs,        only:init_tree_comms
- use stack,            only:init_mpi_memory
-#endif
  use readwrite_dumps,  only:init_readwrite_dumps
  integer :: ierr
 !
@@ -102,14 +98,9 @@ subroutine initialise()
 !--initialise MPI domains
 !
  call init_domains(nprocs)
-#ifdef MPI
- call init_tree_comms()
- call init_mpi_memory()
-#endif
 
  call init_readwrite_dumps()
 
- return
 end subroutine initialise
 
 !----------------------------------------------------------------
@@ -118,20 +109,22 @@ end subroutine initialise
 !+
 !----------------------------------------------------------------
 subroutine startrun(infile,logfile,evfile,dumpfile,noread)
- use mpiutils,         only:reduce_mpi,waitmyturn,endmyturn,reduceall_mpi,barrier_mpi,reduce_in_place_mpi
- use dim,              only:maxp,maxalpha,maxvxyzu,maxptmass,maxdusttypes, &
-                            nalpha,mhd,do_radiation,gravity,use_dust
+ use mpiutils,         only:reduceall_mpi,barrier_mpi,reduce_in_place_mpi
+ use dim,              only:maxp,maxalpha,maxvxyzu,maxptmass,maxdusttypes,itau_alloc,itauL_alloc,&
+                            nalpha,mhd,mhd_nonideal,do_radiation,gravity,use_dust,mpi,do_nucleation,&
+                            use_dustgrowth,ind_timesteps,idumpfile
  use deriv,            only:derivs
  use evwrite,          only:init_evfile,write_evfile,write_evlog
+ use energies,         only:compute_energies
  use io,               only:idisk1,iprint,ievfile,error,iwritein,flush_warnings,&
-                            die,fatal,id,master,nprocs,real4,warning
+                            die,fatal,id,master,nprocs,real4,warning,iverbose
  use externalforces,   only:externalforce,initialise_externalforces,update_externalforce,&
                             externalforce_vdependent
- use options,          only:iexternalforce,idamp,icooling,use_dustfrac,rhofinal1,rhofinal_cgs
+ use options,          only:iexternalforce,icooling,use_dustfrac,rhofinal1,rhofinal_cgs
  use readwrite_infile, only:read_infile,write_infile
  use readwrite_dumps,  only:read_dump,write_fulldump
- use part,             only:npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,dBevol,&
-                            npartoftype,maxtypes,ndusttypes,alphaind,ntot,ndim, &
+ use part,             only:npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,dBevol,tau, tau_lucy, &
+                            npartoftype,maxtypes,ndusttypes,alphaind,ntot,ndim,update_npartoftypetot,&
                             maxphase,iphase,isetphase,iamtype, &
                             nptmass,xyzmh_ptmass,vxyz_ptmass,fxyz_ptmass,igas,idust,massoftype,&
                             epot_sinksink,get_ntypes,isdead_or_accreted,dustfrac,ddustevol,&
@@ -140,35 +133,28 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  use part,             only:pxyzu,dens,metrics,rad,radprop,drad,ithick
  use densityforce,     only:densityiterate
  use linklist,         only:set_linklist
+ use boundary_dyn,     only:dynamic_bdy,init_dynamic_bdy
 #ifdef GR
  use part,             only:metricderivs
  use cons2prim,        only:prim2consall
- use eos,              only:equationofstate,ieos
+ use eos,              only:ieos
  use extern_gr,        only:get_grforce_all
  use metric_tools,     only:init_metric,imet_minkowski,imetric
 #endif
-#ifdef PHOTO
- use photoevap,        only:set_photoevap_grid
-#endif
-#ifdef NONIDEALMHD
  use units,            only:utime,umass,unit_Bfield
  use eos,              only:gmw
  use nicil,            only:nicil_initialise
  use nicil_sup,        only:use_consistent_gmw
-#endif
  use ptmass,           only:init_ptmass,get_accel_sink_gas,get_accel_sink_sink, &
                             h_acc,r_crit,r_crit2,rho_crit,rho_crit_cgs,icreate_sinks, &
                             r_merge_uncond,r_merge_cond,r_merge_uncond2,r_merge_cond2,r_merge2
- use timestep,         only:time,dt,dtextforce,C_force,dtmax
+ use timestep,         only:time,dt,dtextforce,C_force,dtmax,dtmax_user,idtmax_n
  use timing,           only:get_timings
-#ifdef IND_TIMESTEPS
- use timestep,         only:dtmax
- use timestep_ind,     only:istepfrac,ibinnow,maxbins,init_ibin
+ use timestep_ind,     only:ibinnow,maxbins,init_ibin,istepfrac
+ use timing,           only:get_timings
  use part,             only:ibin,ibin_old,ibin_wake,alphaind
  use readwrite_dumps,  only:dt_read_in
-#else
  use timestep,         only:dtcourant,dtforce
-#endif
 #ifdef STS_TIMESTEPS
  use timestep,         only:dtdiff
 #endif
@@ -176,12 +162,8 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
 #ifdef DRIVING
  use forcing,          only:init_forcing
 #endif
-#ifdef DUST
  use dust,             only:init_drag
-#ifdef DUSTGROWTH
  use growth,           only:init_growth
-#endif
-#endif
 #ifdef MFLOW
  use mf_write,         only:mflow_write,mflow_init
  use io,               only:imflow
@@ -194,12 +176,11 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  use mf_write,         only:binpos_write,binpos_init
  use io,               only:ibinpos,igpos
 #endif
-#ifdef MPI
- use balance,          only:balancedomains
- use part,             only:ibelong
-#endif
+ use dust_formation,   only:init_nucleation
 #ifdef INJECT_PARTICLES
  use inject,           only:init_inject,inject_particles
+ use partinject,       only:update_injected_particles
+ use timestep_ind,     only:nbinmax
 #endif
 #ifdef KROME
  use krome_interface,  only:initialise_krome
@@ -211,6 +192,8 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  use io,               only:ianalysis
  use radiation_utils,  only:set_radiation_and_gas_temperature_equal
 #endif
+ use mpibalance,       only:balancedomains
+ use part,             only:ibelong
  use writeheader,      only:write_codeinfo,write_header
  use eos,              only:ieos,init_eos
  use checksetup,       only:check_setup
@@ -221,24 +204,29 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  use energies,         only:etot,angtot,totmom,mdust,xyzcom,mtot
  use checkconserved,   only:get_conserv,etot_in,angtot_in,totmom_in,mdust_in
  use fileutils,        only:make_tags_unique
+ use damping,          only:idamp
  character(len=*), intent(in)  :: infile
  character(len=*), intent(out) :: logfile,evfile,dumpfile
  logical,          intent(in), optional :: noread
- integer         :: ierr,i,j,nerr,nwarn,ialphaloc,merge_n,merge_ij(maxptmass)
- integer(kind=8) :: npartoftypetot(maxtypes)
- real            :: poti,dtf,hfactfile,fextv(3)
+ integer         :: ierr,i,j,nerr,nwarn,ialphaloc,irestart,merge_n,merge_ij(maxptmass)
+ real            :: poti,hfactfile
  real            :: hi,pmassi,rhoi1
  real            :: dtsinkgas,dtsinksink,fonrmax,dtphi2,dtnew_first,dtinject
  real            :: stressmax,xmin,ymin,zmin,xmax,ymax,zmax,dx,dy,dz,tolu,toll
  real            :: dummy(3)
-#ifdef NONIDEALMHD
  real            :: gmw_nicil
+#ifndef GR
+ real            :: dtf,fextv(3)
 #endif
  integer         :: itype,iposinit,ipostmp,ntypes,nderivinit
  logical         :: iexist,read_input_files
- integer :: ncount(maxtypes)
  character(len=len(dumpfile)) :: dumpfileold
  character(len=7) :: dust_label(maxdusttypes)
+#ifdef INJECT_PARTICLES
+ character(len=len(dumpfile)) :: file1D
+ integer :: npart_old
+#endif
+
 
  read_input_files = .true.
  if (present(noread)) read_input_files = .not.noread
@@ -277,16 +265,33 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
        call warning('initial','WARNINGS from particle data in file',var='# of warnings',ival=nwarn)
     endif
     if (nerr > 0)  call fatal('initial','errors in particle data from file',var='errors',ival=nerr)
+!
+!--if starting from a restart dump, rename the dumpefile to that of the previous non-restart dump
+!
+    irestart = index(dumpfile,'.restart')
+    if (irestart > 0) write(dumpfile,'(2a,I5.5)') dumpfile(:irestart-1),'_',idumpfile
  endif
+!
+!--reset dtmax (required only to permit restart dumps)
+!
+ dtmax_user = dtmax           ! the user defined dtmax
+ if (idtmax_n < 1) idtmax_n = 1
+ dtmax      = dtmax/idtmax_n  ! dtmax required to satisfy the walltime constraints
+!
+!--Initialise dynamic boundaries in the first instance
+!
+ if (dynamic_bdy) call init_dynamic_bdy(1,npart,nptmass,dtmax)
 !
 !--initialise values for non-ideal MHD
 !
-#ifdef NONIDEALMHD
- call nicil_initialise(utime,udist,umass,unit_Bfield,ierr,iprint,iprint)
- if (ierr/=0) call fatal('initial','error initialising nicil (the non-ideal MHD library)')
- call use_consistent_gmw(ierr,gmw,gmw_nicil)
- if (ierr/=0) write(iprint,'(2(a,Es18.7))')' initial: Modifying mean molecular mass from ',gmw,' to ',gmw_nicil
-#endif
+ if (mhd_nonideal) then
+    call nicil_initialise(real(utime),real(udist),real(umass),real(unit_Bfield),ierr,iprint,iprint)
+    if (ierr/=0) call fatal('initial','error initialising nicil (the non-ideal MHD library)')
+
+    call use_consistent_gmw(ierr,gmw,gmw_nicil)
+    if (ierr/=0) write(iprint,'(2(a,Es18.7))') &
+       ' initial: Modifying mean molecular weight from ',gmw,' to ',gmw_nicil
+ endif
  nden_nimhd = 0.0
 !
 !--Initialise and verify parameters for super-timestepping
@@ -305,7 +310,7 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
 !--get total number of particles (on all processors)
 !
  ntot           = reduceall_mpi('+',npart)
- npartoftypetot = reduce_mpi('+',npartoftype)
+ call update_npartoftypetot
  if (id==master) write(iprint,"(a,i12)") ' npart total   = ',ntot
  if (npart > 0) then
     if (id==master .and. maxalpha==maxp)  write(iprint,*) 'mean alpha  initial: ',sum(alphaind(1,1:npart))/real(npart)
@@ -319,20 +324,20 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  call init_forcing(dumpfile,infile,time)
 #endif
 
-#ifdef DUST
- call init_drag(ierr)
- if (ierr /= 0) call fatal('initial','error initialising drag coefficients')
-#ifdef DUSTGROWTH
- call init_growth(ierr)
- if (ierr /= 0) call fatal('initial','error initialising growth variables')
-#endif
-#endif
+ if (use_dust) then
+    call init_drag(ierr)
+    if (ierr /= 0) call fatal('initial','error initialising drag coefficients')
+    if (use_dustgrowth) then
+       call init_growth(ierr)
+       if (ierr /= 0) call fatal('initial','error initialising growth variables')
+    endif
+ endif
 !
 !--initialise cooling function
 !  this will initialise all cooling variables, including if h2chemistry = true
  if (icooling > 0) call init_cooling(id,master,iprint,ierr)
 
- if (idamp > 0 .and. any(abs(vxyzu(1:3,:)) > tiny(0.)) .and. abs(time) < tiny(time)) then
+ if (idamp > 0 .and. idamp < 3 .and. any(abs(vxyzu(1:3,:)) > tiny(0.)) .and. abs(time) < tiny(time)) then
     call error('setup','damping on: setting non-zero velocities to zero')
     vxyzu(1:3,:) = 0.
  endif
@@ -362,41 +367,36 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
        endif
        if (use_dustfrac) then
           !--sqrt(epsilon/1-epsilon) method (Ballabio et al. 2018)
-          dustevol(:,i) = sqrt(dustfrac(1:ndustsmall,i)/(1.-dustfrac(1:ndustsmall,i)))
+          dustevol(:,i) = 0.
+          dustevol(1:ndustsmall,i) = sqrt(dustfrac(1:ndustsmall,i)/(1.-dustfrac(1:ndustsmall,i)))
        endif
     enddo
  endif
 
-#ifdef IND_TIMESTEPS
- ibin(:)       = 0
- ibin_old(:)   = 0
- ibin_wake(:)  = 0
- if (dt_read_in) call init_ibin(npart,dtmax)
- istepfrac     = 0
- ibinnow       = 0
-#else
- dtcourant = huge(dtcourant)
- dtforce   = huge(dtforce)
-#endif
+ if (ind_timesteps) then
+    ibin(:)       = 0
+    ibin_old(:)   = 0
+    ibin_wake(:)  = 0
+    if (dt_read_in) call init_ibin(npart,dtmax)
+    istepfrac     = 0
+    ibinnow       = 0
+ else
+    dtcourant = huge(dtcourant)
+    dtforce   = huge(dtforce)
+ endif
  dtinject  = huge(dtinject)
 
 !
 !--balance domains prior to starting calculation
 !  (make sure this is called AFTER iphase has been set)
 !
-#ifdef MPI
- do i=1,npart
-    ibelong(i) = id
- enddo
- call balancedomains(npart)
-#endif
+ if (mpi) then
+    do i=1,npart
+       ibelong(i) = id
+    enddo
+    call balancedomains(npart)
+ endif
 
-!
-!--set up photoevaporation grid, define relevant constants, etc.
-!
-#ifdef PHOTO
- call set_photoevap_grid
-#endif
 !
 !--get timestep for external forces
 !
@@ -404,9 +404,9 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  fext(:,:)  = 0.
 
 #ifdef GR
-! COMPUTE METRIC HERE
- call init_metric(npart,xyzh,metrics,metricderivs)
 #ifdef PRIM2CONS_FIRST
+ ! COMPUTE METRIC HERE
+ call init_metric(npart,xyzh,metrics,metricderivs)
  ! -- The conserved quantites (momentum and entropy) are being computed
  ! -- directly from the primitive values in the starting dumpfile.
  call prim2consall(npart,xyzh,metrics,vxyzu,dens,pxyzu,use_dens=.false.)
@@ -422,13 +422,14 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
                               fxyzu,fext,alphaind,gradh,rad,radprop,dvdx)
  endif
 #ifndef PRIM2CONS_FIRST
+! COMPUTE METRIC HERE
+ call init_metric(npart,xyzh,metrics,metricderivs)
  call prim2consall(npart,xyzh,metrics,vxyzu,dens,pxyzu,use_dens=.false.)
 #endif
  if (iexternalforce > 0 .and. imetric /= imet_minkowski) then
     call initialise_externalforces(iexternalforce,ierr)
     if (ierr /= 0) call fatal('initial','error in external force settings/initialisation')
     call get_grforce_all(npart,xyzh,metrics,metricderivs,vxyzu,dens,fext,dtextforce)
-    write(iprint,*) 'dt(extforce)  = ',dtextforce
  endif
 #else
  if (iexternalforce > 0) then
@@ -450,9 +451,13 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
        endif
     enddo
     !$omp end parallel do
-    write(iprint,*) 'dt(extforce)  = ',dtextforce
  endif
 #endif
+
+ if (iexternalforce > 0) then
+    dtextforce = reduceall_mpi('min',dtextforce)
+    if (id==master) write(iprint,*) 'dt(extforce)  = ',dtextforce
+ endif
 
 !
 !-- Set external force to zero on boundary particles
@@ -470,23 +475,23 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
 !
  dtsinkgas = huge(dtsinkgas)
  r_crit2   = r_crit*r_crit
- rho_crit  = rho_crit_cgs/unit_density
+ rho_crit  = real(rho_crit_cgs/unit_density)
  r_merge_uncond2 = r_merge_uncond**2
  r_merge_cond2   = r_merge_cond**2
  r_merge2        = max(r_merge_uncond2,r_merge_cond2)
  if (rhofinal_cgs > 0.) then
-    rhofinal1 = unit_density/rhofinal_cgs
+    rhofinal1 = real(unit_density/rhofinal_cgs)
  else
     rhofinal1 = 0.0
  endif
  if (nptmass > 0) then
-    write(iprint,"(a,i12)") ' nptmass       = ',nptmass
+    if (id==master) write(iprint,"(a,i12)") ' nptmass       = ',nptmass
 
     ! compute initial sink-sink forces and get timestep
     call get_accel_sink_sink(nptmass,xyzmh_ptmass,fxyz_ptmass,epot_sinksink,dtsinksink,&
                              iexternalforce,time,merge_ij,merge_n)
     dtsinksink = C_force*dtsinksink
-    write(iprint,*) 'dt(sink-sink) = ',dtsinksink
+    if (id==master) write(iprint,*) 'dt(sink-sink) = ',dtsinksink
     dtextforce = min(dtextforce,dtsinksink)
 
     ! compute initial sink-gas forces and get timestep
@@ -515,7 +520,7 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
     dtextforce = reduceall_mpi('min',dtextforce)
  endif
  call init_ptmass(nptmass,logfile)
- if (gravity .and. icreate_sinks > 0) then
+ if (gravity .and. icreate_sinks > 0 .and. id==master) then
     write(iprint,*) 'Sink radius and critical densities:'
     write(iprint,*) ' h_acc                    == ',h_acc*udist,'cm'
     write(iprint,*) ' h_fact*(m/rho_crit)^(1/3) = ',hfactfile*(massoftype(igas)/rho_crit)**(1./3.)*udist,'cm'
@@ -525,22 +530,35 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
        write(iprint,*) ' WARNING! Sink creation is on, but but merging is off!  Suggest setting r_merge_uncond >= 2.0*h_acc'
     endif
  endif
+ if (abs(time) <= tiny(0.)) then
+    !initialize nucleation array at the start of the run only
+    if (do_nucleation) call init_nucleation
+    !initialize optical depth array tau
+    if (itau_alloc == 1) tau = 0.
+    !initialize Lucy optical depth array tau_lucy
+    if (itauL_alloc == 1) tau_lucy = 2./3.
+ endif
 !
 !--inject particles at t=0, and get timestep constraint on this
 !
 #ifdef INJECT_PARTICLES
  call init_inject(ierr)
  if (ierr /= 0) call fatal('initial','error initialising particle injection')
+ !rename wind profile filename
+ inquire(file='wind_profile1D.dat',exist=iexist)
+ if (iexist) then
+    i = len(trim(dumpfile))
+    if (dumpfile(i-2:i) == 'tmp') then
+       file1D = dumpfile(1:i-9) // '1D.dat'
+    else
+       file1D = dumpfile(1:i-5) // '1D.dat'
+    endif
+    call rename('wind_profile1D.dat',trim(file1D))
+ endif
+ npart_old = npart
  call inject_particles(time,0.,xyzh,vxyzu,xyzmh_ptmass,vxyz_ptmass,&
                        npart,npartoftype,dtinject)
-#ifdef GR
-! call update_injected_particles(npart_old,npart,istepfrac,nbinmax,time,dtmax,dt,dtinject)
- call init_metric(npart,xyzh,metrics,metricderivs)
- call prim2consall(npart,xyzh,metrics,vxyzu,dens,pxyzu,use_dens=.false.)
- if (iexternalforce > 0 .and. imetric /= imet_minkowski) then
-    call get_grforce_all(npart,xyzh,metrics,metricderivs,vxyzu,dens,fext,dtextforce) ! Not 100% sure if this is needed here
- endif
-#endif
+ call update_injected_particles(npart_old,npart,istepfrac,nbinmax,time,dtmax,dt,dtinject)
 #endif
 !
 !--set initial chemical abundance values
@@ -558,7 +576,15 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
  if (maxalpha==maxp .and. nalpha >= 0) nderivinit = 2
  if (do_radiation) nderivinit = 1
 
- eos_vars(3,:) = -1.0 ! initial guess for temperature overridden in eos
+ !$omp parallel do default(none) &
+ !$omp shared(npart,eos_vars,fxyzu) &
+ !$omp private(i)
+ do i=1,npart
+    eos_vars(3,i) = -1.0 ! initial guess for temperature overridden in eos
+    fxyzu(:,i) = 0.      ! so that div_a is 0 in first call to viscosity switch
+ enddo
+ !$omp end parallel do
+
  do j=1,nderivinit
     if (ntot > 0) call derivs(1,npart,npart,xyzh,vxyzu,fxyzu,fext,divcurlv,divcurlB,Bevol,dBevol,&
                               rad,drad,radprop,dustprop,ddustprop,dustevol,ddustevol,dustfrac,&
@@ -584,14 +610,18 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
 !
 !--set initial timestep
 !
-#ifndef IND_TIMESTEPS
- dt = min(dtnew_first,dtinject)
- if (id==master) then
-    write(iprint,*) 'dt(forces)    = ',dtforce
-    write(iprint,*) 'dt(courant)   = ',dtcourant
-    write(iprint,*) 'dt initial    = ',dt
+ if (.not.ind_timesteps) then
+    dt = min(dtnew_first,dtinject)
+    if (id==master) then
+       write(iprint,*) 'dt(forces)    = ',dtforce
+       write(iprint,*) 'dt(courant)   = ',dtcourant
+       write(iprint,*) 'dt initial    = ',dt
+    endif
  endif
-#endif
+!
+!--initialise dynamic boundaries in the second instance
+!
+ if (dynamic_bdy) call init_dynamic_bdy(2,npart,nptmass,dtmax)
 !
 !--Calculate current centre of mass
 !
@@ -620,12 +650,12 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
 #endif
 !
 !--Determine the maximum separation of particles
- xmax = -huge(xmax)
- ymax = -huge(ymax)
- zmax = -huge(zmax)
- xmin =  huge(xmin)
- ymin =  huge(ymin)
- zmin =  huge(zmin)
+ xmax = -0.5*huge(xmax)
+ ymax = -0.5*huge(ymax)
+ zmax = -0.5*huge(zmax)
+ xmin = -xmax
+ ymin = -ymax
+ zmin = -zmax
  !$omp parallel do default(none) &
  !$omp shared(npart,xyzh) &
  !$omp private(i) &
@@ -642,22 +672,30 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
     endif
  enddo
  !$omp end parallel do
+
+ xmin = reduceall_mpi('min',xmin)
+ ymin = reduceall_mpi('min',ymin)
+ zmin = reduceall_mpi('min',zmin)
+ xmax = reduceall_mpi('max',xmax)
+ ymax = reduceall_mpi('max',ymax)
+ zmax = reduceall_mpi('max',zmax)
+
  dx = abs(xmax - xmin)
  dy = abs(ymax - ymin)
  dz = abs(zmax - zmin)
 !
 !--Print box sizes and masses
 !
- if (id==master) then
+ if (id==master .and. iverbose >= 1) then
     if (get_conserv > 0.0) then
-       write(iprint,'(1x,a)') 'Initial mass and box size (in code units):'
+       write(iprint,'(1x,a)') 'Initial mass and extent of particle distribution (in code units):'
     else
-       write(iprint,'(1x,a)') 'Mass and box size (in code units) of this restart:'
+       write(iprint,'(1x,a)') 'Mass and extent of the particle distribution:'
     endif
-    write(iprint,'(2x,a,es18.6)') 'Total mass: ', mtot
-    write(iprint,'(2x,a,es18.6)') 'x-Box size: ', dx
-    write(iprint,'(2x,a,es18.6)') 'y-Box size: ', dy
-    write(iprint,'(2x,a,es18.6)') 'z-Box size: ', dz
+    write(iprint,'(2x,a,es18.6)') '     Total mass : ', mtot
+    write(iprint,'(2x,a,es18.6)') 'x(max) - x(min) : ', dx
+    write(iprint,'(2x,a,es18.6)') 'y(max) - y(min) : ', dy
+    write(iprint,'(2x,a,es18.6)') 'z(max) - z(min) : ', dz
     write(iprint,'(a)') ' '
  endif
 !
@@ -669,36 +707,44 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
     angtot_in = angtot
     totmom_in = totmom
     mdust_in  = mdust
-    if (id==master) write(iprint,'(1x,a)') 'Setting initial values (in code units) to verify conservation laws:'
+    if (id==master .and. iverbose >= 1) then
+       write(iprint,'(1x,a)') 'Setting initial values to verify conservation laws:'
+    endif
  else
-    if (id==master) then
-       write(iprint,'(1x,a)') 'Reading initial values (in code units) to verify conservation laws from previous run:'
+    if (id==master .and. iverbose >= 1) then
+       write(iprint,'(1x,a)') 'Reading initial values to verify conservation laws from previous run:'
     endif
  endif
  if (id==master) then
-    write(iprint,'(2x,a,es18.6)') 'Initial total energy:     ', etot_in
-    write(iprint,'(2x,a,es18.6)') 'Initial angular momentum: ', angtot_in
-    write(iprint,'(2x,a,es18.6)') 'Initial linear momentum:  ', totmom_in
+    if (iverbose >= 1) then
+       write(iprint,'(1x,a,es18.6)') 'Initial total energy:     ', etot_in
+       write(iprint,'(1x,a,es18.6)') 'Initial angular momentum: ', angtot_in
+       write(iprint,'(1x,a,es18.6)') 'Initial linear momentum:  ', totmom_in
+    endif
     if (use_dust) then
        dust_label = 'dust'
        call make_tags_unique(ndusttypes,dust_label)
        do i=1,ndusttypes
-          if (mdust_in(i) > 0.) write(iprint,'(2x,a,es18.6)') 'Initial '//trim(dust_label(i))//' mass:     ',mdust_in(i)
+          if (mdust_in(i) > 0.) write(iprint,'(1x,a,es18.6)') 'Initial '//trim(dust_label(i))//' mass:     ',mdust_in(i)
        enddo
-       write(iprint,'(2x,a,es18.6)') 'Initial total dust mass:  ', sum(mdust_in(:))
+       write(iprint,'(1x,a,es18.6)') 'Initial total dust mass:', sum(mdust_in(:))
     endif
  endif
 !
 !--Print warnings of units if values are not reasonable
 !
- tolu = 1.0d2
- toll = 1.0d-2
+ tolu = 1.0e2
+ toll = 1.0e-2
  if (get_conserv > 0.0) then
     get_conserv = -1.
-    if (abs(etot_in) > tolu ) call warning('initial','consider changing code-units to reduce abs(total energy)')
-    if (mtot > tolu .or. mtot < toll) call warning('initial','consider changing code-units to have total mass closer to unity')
-    if (dx > tolu .or. dx < toll .or. dy > tolu .or. dy < toll .or. dz > tolu .or. dz < toll) &
-    call warning('initial','consider changing code-units to have box length closer to unity')
+    if (id==master) then
+       if (abs(etot_in) > tolu ) call warning('initial',&
+          'consider changing units to reduce abs(total energy)',var='etot',val=etot_in)
+       if (mtot > tolu .or. mtot < toll)  call warning('initial',&
+          'consider changing units so total mass is closer to unity',var='mtot',val=mtot)
+       ! if (dx > tolu .or. dx < toll .or. dy > tolu .or. dy < toll .or. dz > tolu .or. dz < toll) &
+       !call warning('initial','consider changing code-units to have box length closer to unity')
+    endif
  endif
 !
 !--write initial conditions to output file
@@ -740,7 +786,6 @@ subroutine startrun(infile,logfile,evfile,dumpfile,noread)
     call get_timings(twall_start,tcpu_start)
  endif
 
- return
 end subroutine startrun
 
 !----------------------------------------------------------------
@@ -749,13 +794,15 @@ end subroutine startrun
 !+
 !----------------------------------------------------------------
 subroutine finalise()
-#ifdef MPI
- use mpiderivs,       only:finish_tree_comms
- use stack,           only:finish_mpi_memory
+ use dim, only: mpi
+ use mpitree, only:finish_tree_comms
+ use mpimemory, only:deallocate_mpi_memory
 
- call finish_tree_comms()
- call finish_mpi_memory()
-#endif
+ if (mpi) then
+    call finish_tree_comms()
+    call deallocate_mpi_memory()
+ endif
+
 end subroutine finalise
 
 !----------------------------------------------------------------

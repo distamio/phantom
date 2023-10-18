@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module datafiles
 !
@@ -20,7 +20,7 @@ module datafiles
 !
  implicit none
  character(len=*), parameter :: data_url = &
-  'http://users.monash.edu.au/~dprice/phantom/'
+  'https://users.monash.edu.au/~dprice/phantom/'
 
 contains
 

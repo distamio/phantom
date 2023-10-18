@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module mpidens
 !
@@ -14,21 +14,37 @@ module mpidens
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: dim, io, mpi, mpiutils
+! :Dependencies: dim, io, mpi
 !
- use io,       only:nprocs,fatal
- use dim,      only:minpart,maxrhosum,maxprocs,stacksize,maxxpartvecidens
-#ifdef MPI
- use mpiutils, only:mpierr
-#endif
+ use io,       only:nprocs,fatal,error
+ use dim,      only:minpart,maxrhosum,maxxpartvecidens
+
  implicit none
  private
 
  public :: celldens
  public :: stackdens
-#ifdef MPI
  public :: get_mpitype_of_celldens
-#endif
+ public :: free_mpitype_of_celldens
+
+ integer, parameter :: ndata = 18 ! number of elements in the cell (including padding)
+ integer, parameter :: nbytes_celldens = 8 * minpart                    + & !  h(minpart)
+                                         8 * minpart                    + & !  h_old(minpart)
+                                         8 * maxxpartvecidens * minpart + & !  xpartvec(maxxpartvecidens,minpart)
+                                         8 * maxrhosum * minpart        + & !  rhosums(maxrhosum,minpart)
+                                         8 * 3                          + & !  xpos(3)
+                                         8                              + & !  xsizei
+                                         8                              + & !  rcuti
+                                         8                              + & !  hmax
+                                         4                              + & !  icell
+                                         4                              + & !  npcell
+                                         4 * minpart                    + & !  arr_index(minpart)
+                                         4                              + & !  owner
+                                         4                              + & !  nits
+                                         4                              + & !  nneightry
+                                         4 * minpart                    + & !  nneigh(minpart)
+                                         4                              + & !  waiting_index
+                                         1 * minpart                        !  iphase(minpart)
 
  type celldens
     sequence
@@ -48,9 +64,8 @@ module mpidens
     integer          :: nneightry
     integer          :: nneigh(minpart)                        ! number of actual neighbours (diagnostic)
     integer          :: waiting_index
-    logical          :: remote_export(maxprocs)                ! remotes we are waiting for
     integer(kind=1)  :: iphase(minpart)
-    integer(kind=1)  :: pad(8 - mod(4 * (6 + 2 * minpart + maxprocs) + minpart, 8))
+    integer(kind=1)  :: pad(8 - mod(nbytes_celldens, 8))
  end type celldens
 
  type stackdens
@@ -58,25 +73,24 @@ module mpidens
     type(celldens), pointer   :: cells(:)
     integer                   :: maxlength = 0
     integer                   :: n = 0
-    integer                   :: mem_start
-    integer                   :: mem_end
+    integer                   :: number
  end type stackdens
 
 contains
 
-#ifdef MPI
 subroutine get_mpitype_of_celldens(dtype)
+#ifdef MPI
  use mpi
-
- integer, parameter              :: ndata = 20
-
+ use io,       only:error
+#endif
  integer, intent(out)            :: dtype
- integer                         :: dtype_old
+#ifdef MPI
  integer                         :: nblock, blens(ndata), mpitypes(ndata)
- integer(kind=4)                 :: disp(ndata)
+ integer(kind=MPI_ADDRESS_KIND)  :: disp(ndata)
 
- type(celldens)                 :: cell
+ type(celldens)                  :: cell
  integer(kind=MPI_ADDRESS_KIND)  :: addr,start,lb,extent
+ integer                         :: mpierr
 
  nblock = 0
 
@@ -179,38 +193,42 @@ subroutine get_mpitype_of_celldens(dtype)
  disp(nblock) = addr - start
 
  nblock = nblock + 1
- blens(nblock) = size(cell%remote_export)
- mpitypes(nblock) = MPI_LOGICAL
- call MPI_GET_ADDRESS(cell%remote_export,addr,mpierr)
- disp(nblock) = addr - start
-
- nblock = nblock + 1
  blens(nblock) = size(cell%iphase)
  mpitypes(nblock) = MPI_INTEGER1
  call MPI_GET_ADDRESS(cell%iphase,addr,mpierr)
  disp(nblock) = addr - start
 
  nblock = nblock + 1
- blens(nblock) = 8 - mod(4 * (6 + 2 * minpart + maxprocs) + minpart, 8)
+ blens(nblock) = 8 - mod(4 * (6 + 2 * minpart) + minpart, 8)
  mpitypes(nblock) = MPI_INTEGER1
  call MPI_GET_ADDRESS(cell%pad,addr,mpierr)
  disp(nblock) = addr - start
 
- call MPI_TYPE_STRUCT(nblock,blens(1:nblock),disp(1:nblock),mpitypes(1:nblock),dtype,mpierr)
+ call MPI_TYPE_CREATE_STRUCT(nblock,blens(1:nblock),disp(1:nblock),mpitypes(1:nblock),dtype,mpierr)
  call MPI_TYPE_COMMIT(dtype,mpierr)
 
  ! check extent okay
  call MPI_TYPE_GET_EXTENT(dtype,lb,extent,mpierr)
  if (extent /= sizeof(cell)) then
-    dtype_old = dtype
-    lb = 0
-    extent = sizeof(cell)
-    call MPI_TYPE_CREATE_RESIZED(dtype_old,lb,extent,dtype,mpierr)
-    call MPI_TYPE_COMMIT(dtype,mpierr)
-    call MPI_TYPE_FREE(dtype_old,mpierr)
+    call error('mpi_dens','MPI_TYPE_GET_EXTENT has calculated the extent incorrectly')
  endif
 
-end subroutine get_mpitype_of_celldens
+#else
+ dtype = 0
 #endif
+end subroutine get_mpitype_of_celldens
+
+subroutine free_mpitype_of_celldens(dtype)
+#ifdef MPI
+ use mpi
+#endif
+ integer, intent(inout) :: dtype
+#ifdef MPI
+ integer                :: mpierr
+
+ call MPI_Type_free(dtype,mpierr)
+#endif
+
+end subroutine free_mpitype_of_celldens
 
 end module mpidens

@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module setup
 !
@@ -14,8 +14,8 @@ module setup
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: boundary, domain, io, mpiutils, part, physcon, prompting,
-!   setup_params, unifdis, units
+! :Dependencies: boundary, io, mpidomain, mpiutils, part, physcon,
+!   prompting, setup_params, unifdis, units
 !
  implicit none
  public :: setpart
@@ -37,11 +37,11 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  use unifdis,      only:set_unifdis
  use boundary,     only:xmin,ymin,zmin,xmax,ymax,zmax,dxbound,dybound,dzbound
  use mpiutils,     only:bcast_mpi
- use part,         only:labeltype,set_particle_type,igas,periodic
+ use part,         only:labeltype,set_particle_type,igas,idust,periodic
  use physcon,      only:pi,solarm,au
  use units,        only:set_units
  use prompting,    only:prompt
- use domain,       only:i_belong
+ use mpidomain,    only:i_belong
  integer,           intent(in)    :: id
  integer,           intent(inout) :: npart
  integer,           intent(out)   :: npartoftype(:)
@@ -52,7 +52,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  real,              intent(inout) :: time
  character(len=20), intent(in)    :: fileprefix
  real    :: totmass
- integer :: i,maxp,maxvxyzu
+ integer :: i,j,maxp,maxvxyzu
  integer :: itype,ntypes
  integer :: npart_previous
  logical, parameter :: ishift_box =.true.
@@ -77,7 +77,12 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  npartoftype(:) = 0
 
  ntypes = 2
- overtypes: do itype=1,ntypes
+ overtypes: do j=1,ntypes
+    if (j==1) then
+       itype = igas
+    else
+       itype = idust + (j-2)
+    endif
     if (id==master) then
        if (itype==1) npartx = 64
        if (ntypes > 1) then

@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module setup
 !
@@ -14,7 +14,7 @@ module setup
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: boundary, dim, domain, dust, io, kernel, mpiutils,
+! :Dependencies: boundary, dim, dust, io, kernel, mpidomain, mpiutils,
 !   options, part, physcon, prompting, set_dust, setup_params, unifdis
 !
  implicit none
@@ -35,7 +35,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  use unifdis,      only:set_unifdis,rho_func
  use boundary,     only:set_boundary,xmin,ymin,zmin,xmax,ymax,zmax,dxbound,dybound,dzbound
  use mpiutils,     only:bcast_mpi
- use part,         only:labeltype,set_particle_type,igas,idust,dustfrac,periodic
+ use part,         only:labeltype,set_particle_type,igas,idust,dustfrac,periodic,ndustsmall,ndustlarge,ndusttypes
  use physcon,      only:pi
  use kernel,       only:radkern
  use dim,          only:maxvxyzu,use_dust,maxp
@@ -43,7 +43,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  use prompting,    only:prompt
  use dust,         only:K_code,idrag
  use set_dust,     only:set_dustfrac
- use domain,       only:i_belong
+ use mpidomain,    only:i_belong
  integer,           intent(in)    :: id
  integer,           intent(inout) :: npart
  integer,           intent(out)   :: npartoftype(:)
@@ -73,6 +73,8 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  cs      = 1.
  ampl    = 1.d-4
  use_dustfrac = .false.
+ ndustsmall = 0
+ ndustlarge = 0
  if (id==master) then
     itype = 1
     print "(/,a,/)",'  >>> Setting up particles for linear wave test <<<'
@@ -92,11 +94,16 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
        call prompt('Enter constant drag coefficient',K_code(1),0.)
        if (use_dustfrac) then
           massfac = 1. + dtg
+          ndustsmall = 1
        else
           ntypes  = 2
+          ndustlarge = 1
        endif
     endif
  endif
+ call bcast_mpi(ndustsmall)
+ call bcast_mpi(ndustlarge)
+ ndusttypes = ndustsmall + ndustlarge
  call bcast_mpi(npartx)
 !
 ! boundaries
@@ -109,7 +116,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  fac = 6.*(int((1.-epsilon(0.))*radkern/6.) + 1)
  deltay = fac*deltax*sqrt(0.75)
  deltaz = fac*deltax*sqrt(6.)/3.
- call set_boundary(xmin,xmax,-deltay,deltay,-deltaz,deltaz)
+ call set_boundary(xmini,xmaxi,-deltay,deltay,-deltaz,deltaz)
 !
 ! general parameters
 !

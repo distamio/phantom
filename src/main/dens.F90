@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module densityforce
 !
@@ -16,8 +16,8 @@ module densityforce
 ! :Runtime parameters: None
 !
 ! :Dependencies: boundary, dim, io, io_summary, kdtree, kernel, linklist,
-!   mpidens, mpiderivs, mpiutils, options, part, stack, timestep, timing,
-!   viscosity
+!   mpidens, mpiderivs, mpimemory, mpiutils, omputils, options, part,
+!   timestep, timing, viscosity
 !
  use dim,     only:maxdvdx,maxp,maxrhosum,maxdustlarge
  use dim,     only:calculate_density,calculate_divcurlB
@@ -27,8 +27,6 @@ module densityforce
  use timing,  only:getused,printused,print_time
 
  implicit none
- character(len=80), parameter, public :: &  ! module version
-    modid="$Id$"
 
  public :: densityiterate,get_neighbour_stats
 
@@ -99,7 +97,7 @@ module densityforce
 
  !--kernel related parameters
  !real, parameter    :: cnormk = 1./pi, wab0 = 1., gradh0 = -3.*wab0, radkern2 = 4F.0
- integer, parameter :: isizecellcache = 50000
+ integer, parameter :: isizecellcache = 1000
  integer, parameter :: isizeneighcache = 0
  integer, parameter :: maxdensits = 50
 
@@ -119,25 +117,26 @@ contains
 !----------------------------------------------------------------
 subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol,stressmax,&
                           fxyzu,fext,alphaind,gradh,rad,radprop,dvdx)
- use dim,       only:maxp,maxneigh,ndivcurlv,ndivcurlB,maxalpha,mhd_nonideal,nalpha,use_dust,fast_divcurlB
+ use dim,       only:maxp,maxneigh,ndivcurlv,ndivcurlB,maxalpha,mhd_nonideal,nalpha,&
+                     use_dust,fast_divcurlB,mpi,gr
  use io,        only:iprint,fatal,iverbose,id,master,real4,warning,error,nprocs
  use linklist,  only:ifirstincell,ncells,get_neighbour_list,get_hmaxcell,&
                      listneigh,get_cell_location,set_hmaxcell,sync_hmax_mpi
  use part,      only:mhd,rhoh,dhdrho,rhoanddhdrho,ll,get_partinfo,iactive,&
                      hrho,iphase,igas,idust,iamgas,periodic,all_active,dustfrac
  use mpiutils,  only:reduceall_mpi,barrier_mpi,reduce_mpi,reduceall_mpi
-#ifdef MPI
- use stack,     only:reserve_stack,swap_stacks
- use stack,     only:stack_remote => dens_stack_1
- use stack,     only:stack_waiting => dens_stack_2
- use stack,     only:stack_redo => dens_stack_3
- use mpiderivs, only:send_cell,recv_cells,check_send_finished,init_cell_exchange, &
-                     finish_cell_exchange,recv_while_wait,reset_cell_counters
-#endif
+ use mpimemory, only:reserve_stack,swap_stacks,reset_stacks,write_cell
+ use mpimemory, only:stack_remote  => dens_stack_1
+ use mpimemory, only:stack_waiting => dens_stack_2
+ use mpimemory, only:stack_redo    => dens_stack_3
+ use mpiderivs, only:send_cell,recv_cells,check_send_finished,init_cell_exchange,&
+                     finish_cell_exchange,recv_while_wait,reset_cell_counters,cell_counters
  use timestep,  only:rhomaxnow
  use part,      only:ngradh
  use viscosity, only:irealvisc
  use io_summary,only:summary_variable,iosumhup,iosumhdn
+ use timing,    only:increment_timer,get_timings,itimer_dens_local,itimer_dens_remote
+ use omputils,  only:omp_thread_num,omp_num_threads
  integer,      intent(in)    :: icall,npart,nactive
  real,         intent(inout) :: xyzh(:,:)
  real,         intent(in)    :: vxyzu(:,:),fxyzu(:,:),fext(:,:)
@@ -155,37 +154,35 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
 !$omp threadprivate(xyzcache)
 
  integer :: i,icell
- integer :: nneigh,np
+ integer :: nneigh,np,npcell
  integer :: nwarnup,nwarndown,nwarnroundoff
 
  logical :: getdv,realviscosity,getdB,converged
  logical :: iactivei,iamgasi,iamdusti
  integer :: iamtypei
 
- logical :: remote_export(nprocs)
-
  real    :: rhomax
-
- integer                   :: npcell
-
- type(celldens)            :: cell
 
  logical                   :: redo_neighbours
 
-#ifdef MPI
  integer                   :: j,k,l
  integer                   :: irequestsend(nprocs),irequestrecv(nprocs)
- type(celldens)            :: xrecvbuf(nprocs),xsendbuf
- integer                   :: mpiits,nlocal
- real                      :: ntotal
- logical                   :: iterations_finished
- logical                   :: do_export
 
- call init_cell_exchange(xrecvbuf,irequestrecv)
- stack_waiting%n = 0
- stack_remote%n = 0
- stack_redo%n = 0
-#endif
+ type(celldens)            :: cell,xsendbuf,xrecvbuf(nprocs)
+ integer                   :: mpitype
+
+ integer                   :: n_remote_its,nlocal
+ integer                   :: ncomplete_mpi
+ real                      :: ntotal
+ logical                   :: remote_export(nprocs),do_export,idone(nprocs),thread_complete(omp_num_threads)
+ logical                   :: iterations_finished
+
+ real(kind=4)              :: t1,t2,tcpu1,tcpu2
+
+ if (mpi) then
+    call reset_stacks
+    call reset_cell_counters(cell_counters)
+ endif
 
  if (iverbose >= 3 .and. id==master) &
     write(iprint,*) ' cell cache =',isizecellcache,' neigh cache = ',isizeneighcache,' icall = ',icall
@@ -204,7 +201,7 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
  !
  realviscosity = (irealvisc > 0)
  getdv = ((maxalpha==maxp .or. ndivcurlv >= 4) .and. (icall <= 1 .or. icall==3)) .or. &
-         (maxdvdx==maxp .and. (use_dust .or. realviscosity))
+         (maxdvdx==maxp .and. (use_dust .or. realviscosity .or. gr))
  if (getdv .and. ndivcurlv < 1) call fatal('densityiterate','divv not stored but it needs to be')
  getdB = (mhd .and. (ndivcurlB >= 4 .or. mhd_nonideal))
 
@@ -224,12 +221,8 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
     endif
  endif
 
-#ifdef MPI
- ! number of local only cells
+ ! number of cells that only have neighbours on this MPI task
  nlocal = 0
- call reset_cell_counters
-
-#endif
 
  rhomax = 0.0
 !$omp parallel default(none) &
@@ -258,23 +251,24 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
 !$omp shared(iprint) &
 !$omp shared(rad,radprop) &
 !$omp shared(calculate_density) &
-#ifdef MPI
-!$omp shared(xrecvbuf) &
-!$omp shared(xsendbuf) &
-!$omp shared(irequestrecv) &
-!$omp shared(irequestsend) &
 !$omp shared(stack_remote) &
 !$omp shared(stack_waiting) &
 !$omp shared(stack_redo) &
 !$omp shared(iterations_finished) &
-!$omp shared(mpiits) &
+!$omp shared(n_remote_its) &
+!$omp shared(t1) &
+!$omp shared(t2) &
+!$omp shared(tcpu1) &
+!$omp shared(tcpu2) &
+!$omp shared(cell_counters) &
+!$omp shared(thread_complete) &
+!$omp shared(ncomplete_mpi) &
 !$omp reduction(+:nlocal) &
 !$omp private(do_export) &
 !$omp private(j) &
 !$omp private(k) &
 !$omp private(l) &
 !$omp private(ntotal) &
-#endif
 !$omp private(remote_export) &
 !$omp private(nneigh) &
 !$omp private(npcell) &
@@ -285,6 +279,12 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
 !$omp private(iamdusti) &
 !$omp private(converged) &
 !$omp private(redo_neighbours) &
+!$omp private(irequestsend) &
+!$omp private(xsendbuf) &
+!$omp private(xrecvbuf) &
+!$omp private(irequestrecv) &
+!$omp private(idone) &
+!$omp private(mpitype) &
 !$omp reduction(+:ncalc) &
 !$omp reduction(+:np) &
 !$omp reduction(max:maxneighact) &
@@ -296,67 +296,57 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
 !$omp reduction(max:rhomax) &
 !$omp private(i)
 
-!$omp do schedule(runtime)
+ call init_cell_exchange(xrecvbuf,irequestrecv,thread_complete,ncomplete_mpi,mpitype)
+
+ !$omp master
+ call get_timings(t1,tcpu1)
+ !$omp end master
+
+ !--initialise send requests to 0
+ irequestsend = 0
+
+ !$omp do schedule(runtime)
  over_cells: do icell=1,int(ncells)
     i = ifirstincell(icell)
 
     !--skip empty cells AND inactive cells
     if (i <= 0) cycle over_cells
 
-    !
     !--get the neighbour list and fill the cell cache
-    !
     call get_neighbour_list(icell,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
                            remote_export=remote_export)
-#ifdef MPI
-    if (any(remote_export)) then
-       do_export = .true.
-    else
-       do_export = .false.
-    endif
-#endif
-    cell%icell                   = icell
-#ifdef MPI
-    cell%owner                   = id
-#endif
-    cell%nits                    = 0
-    cell%nneigh                  = 0
-    cell%remote_export(1:nprocs) = remote_export
+    do_export = any(remote_export)
+    cell%icell  = icell
+    cell%owner  = id
+    cell%nits   = 0
+    cell%nneigh = 0
 
     call start_cell(cell,iphase,xyzh,vxyzu,fxyzu,fext,Bevol,rad)
-
     call get_cell_location(icell,cell%xpos,cell%xsizei,cell%rcuti)
     call get_hmaxcell(icell,cell%hmax)
 
-#ifdef MPI
-!$omp critical
-    call recv_cells(stack_remote,xrecvbuf,irequestrecv)
-!$omp end critical
-
-    if (do_export) then
-!$omp critical
-       if (stack_waiting%n > 0) call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
-       ! make a reservation on the stack
-       call reserve_stack(stack_waiting,cell%waiting_index)
-       ! export the cell: direction 0 for exporting
-       call send_cell(cell,0,irequestsend,xsendbuf)
-!$omp end critical
+    if (mpi) then
+       call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
+       if (do_export) then
+          if (stack_waiting%n > 0) then
+             !--wait for broadcast to complete, continue to receive whilst doing so
+             idone(:) = .false.
+             do while(.not.all(idone))
+                call check_send_finished(irequestsend,idone)
+                call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
+             enddo
+          endif
+          call reserve_stack(stack_waiting,cell%waiting_index)  ! make a reservation on the stack
+          call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype)  ! send the cell to remote
+       endif
     endif
-#endif
 
     call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,rad)
 
-#ifdef MPI
     if (do_export) then
-       ! write directly to stack
-       stack_waiting%cells(cell%waiting_index) = cell
+       call write_cell(stack_waiting,cell)
     else
-#endif
-       if (calculate_density) then
-          converged = .false.
-       else
-          converged = .true.
-       endif
+       converged = (.not. calculate_density)
        local_its: do while (.not. converged)
           call finish_cell(cell,converged)
           call compute_hmax(cell,redo_neighbours)
@@ -367,72 +357,86 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
                 call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
                                       cell_xpos=cell%xpos,cell_xsizei=cell%xsizei,cell_rcuti=cell%rcuti, &
                                       remote_export=remote_export)
-#ifdef MPI
-                cell%remote_export(1:nprocs) = remote_export
+
                 if (any(remote_export)) then
                    do_export = .true.
-!$omp critical
-                   if (stack_waiting%n > 0) call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
+                   if (stack_waiting%n > 0) then
+                      !--wait for broadcast to complete, continue to receive whilst doing so
+                      idone(:) = .false.
+                      do while(.not.all(idone))
+                         call check_send_finished(irequestsend,idone)
+                         call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
+                      enddo
+                   endif
                    call reserve_stack(stack_waiting,cell%waiting_index)
-                   ! direction export (0)
-                   call send_cell(cell,0,irequestsend,xsendbuf)
-!$omp end critical
+                   call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype)  ! send to remote
                 endif
-#endif
                 nrelink = nrelink + 1
              endif
+
              call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,rad)
-#ifdef MPI
+
              if (do_export) then
-                stack_waiting%cells(cell%waiting_index) = cell
+                call write_cell(stack_waiting,cell)
                 exit local_its
              endif
-#endif
+
           endif
        enddo local_its
-#ifdef MPI
        if (.not. do_export) then
-#endif
           call store_results(icall,cell,getdv,getdB,realviscosity,stressmax,xyzh,gradh,divcurlv, &
                divcurlB,alphaind,dvdx,vxyzu,&
                dustfrac,rhomax,nneightry,nneighact,maxneightry,maxneighact,np,ncalc,radprop)
-#ifdef MPI
           nlocal = nlocal + 1
        endif
     endif
-#endif
  enddo over_cells
-!$omp enddo
+ !$omp enddo
 
-#ifdef MPI
-!$omp barrier
+ ! if any cells were sent
+ if (stack_waiting%n > 0) then
+    idone(:) = .false.
+    do while(.not.all(idone))
+       call check_send_finished(irequestsend,idone)
+       call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
+    enddo
+ endif
 
-!$omp single
- if (stack_waiting%n > 0) call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
- call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,irequestsend)
-!$omp end single
+ if (mpi) then
+    call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,&
+         irequestsend,thread_complete,cell_counters,ncomplete_mpi)
+ endif
 
-!$omp single
+ !$omp master
+ call get_timings(t2,tcpu2)
+ call increment_timer(itimer_dens_local,t2-t1,tcpu2-tcpu1)
+ call get_timings(t1,tcpu1)
+
  if (iverbose>=6) then
     ntotal = real(nlocal) + real(stack_waiting%n)
     if (ntotal > 0) then
-       write(iprint,*) id,'local ratio = ',real(nlocal)/ntotal
+       write(iprint,*) id,'domain decomposition efficiency: local cells / ncells = ',real(nlocal)/ntotal
     else
-       write(iprint,*) id,'local ratio = 0'
+       write(iprint,*) id,'domain decomposition efficiency: local cells / ncells = 0'
     endif
  endif
 
- mpiits = 0
+ n_remote_its = 0
  iterations_finished = .false.
-!$omp end single
+ if (.not.mpi) iterations_finished = .true.
+ !$omp end master
+ !$omp barrier
+
  remote_its: do while(.not. iterations_finished)
-!$omp single
-    mpiits = mpiits + 1
-    call reset_cell_counters
-!$omp end single
+
+    !$omp master
+    n_remote_its = n_remote_its + 1
+    !$omp end master
+    call reset_cell_counters(cell_counters)
+    !$omp barrier
 
     igot_remote: if (stack_remote%n > 0) then
-!$omp do schedule(runtime)
+       !$omp do schedule(runtime)
        over_remote: do i = 1,stack_remote%n
           cell = stack_remote%cells(i)
 
@@ -442,46 +446,40 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
 
           call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,rad)
 
-          cell%remote_export(id+1) = .false.
+          remote_export = .false.
+          remote_export(cell%owner+1) = .true. ! use remote_export array to send back to the owner
 
           ! communication happened while computing contributions to remote cells
-!$omp critical
-          call recv_cells(stack_waiting,xrecvbuf,irequestrecv)
-          call check_send_finished(stack_waiting,irequestsend,irequestrecv,xrecvbuf)
-          ! direction return (1)
-          call send_cell(cell,1,irequestsend,xsendbuf)
-!$omp end critical
+          idone(:) = .false.
+          do while(.not.all(idone))
+             call check_send_finished(irequestsend,idone)
+             call recv_cells(stack_waiting,xrecvbuf,irequestrecv,cell_counters)
+          enddo
+
+          call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype) ! send the cell back to owner
        enddo over_remote
-!$omp enddo
-!$omp barrier
-!$omp single
-       ! reset remote stack
+       !$omp enddo
+
+       !$omp master
        stack_remote%n = 0
-       ! ensure send has finished
-       call check_send_finished(stack_waiting,irequestsend,irequestrecv,xrecvbuf)
-!$omp end single
+       !$omp end master
+
+       idone(:) = .false.
+       do while(.not.all(idone))
+          call check_send_finished(irequestsend,idone)
+          call recv_cells(stack_waiting,xrecvbuf,irequestrecv,cell_counters)
+       enddo
     endif igot_remote
-!$omp barrier
-!$omp single
-    call recv_while_wait(stack_waiting,xrecvbuf,irequestrecv,irequestsend)
-    call reset_cell_counters
-!$omp end single
-    iam_waiting: if (stack_waiting%n > 0) then
-!$omp do schedule(runtime)
+
+    if (mpi) call recv_while_wait(stack_waiting,xrecvbuf,irequestrecv,&
+             irequestsend,thread_complete,cell_counters,ncomplete_mpi)
+    call reset_cell_counters(cell_counters)
+    !$omp barrier
+
+    iam_waiting: if (mpi .and. stack_waiting%n > 0) then
+       !$omp do schedule(runtime)
        over_waiting: do i = 1, stack_waiting%n
           cell = stack_waiting%cells(i)
-
-          if (any(cell%remote_export(1:nprocs))) then
-             print*,id,cell%remote_export(1:nprocs)
-             print*,id,'mpiits',mpiits
-             print*,id,'owner',cell%owner
-             print*,id,'icell',cell%icell
-             print*,id,'npcell',cell%npcell
-             print*,id,'xpos',cell%xpos
-             print*,id,'stackpos',i
-             print*,id,'waitindex',cell%waiting_index
-             call fatal('dens', 'not all results returned from remote processor')
-          endif
 
           if (calculate_density) then
              call finish_cell(cell,converged)
@@ -490,25 +488,26 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
              converged = .true.
           endif
 
-          ! communication happened while finishing cell
-!$omp critical
-          call recv_cells(stack_remote,xrecvbuf,irequestrecv)
-!$omp end critical
+          ! check for incoming cells (if converged, this may not be checked until enxt cell)
+          call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
+
           if (.not. converged) then
              call set_hmaxcell(cell%icell,cell%hmax)
              call get_neighbour_list(-1,listneigh,nneigh,xyzh,xyzcache,isizecellcache,getj=.false., &
                                     cell_xpos=cell%xpos,cell_xsizei=cell%xsizei,cell_rcuti=cell%rcuti, &
                                     remote_export=remote_export)
-             cell%remote_export(1:nprocs) = remote_export
-!$omp critical
-             call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
+
+             idone(:) = .false.
+             do while(.not.all(idone))
+                call check_send_finished(irequestsend,idone)
+                call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
+             enddo
              call reserve_stack(stack_redo,cell%waiting_index)
-             ! direction export (0)
-             call send_cell(cell,0,irequestsend,xsendbuf)
-!$omp end critical
+             call send_cell(cell,remote_export,irequestsend,xsendbuf,cell_counters,mpitype) ! send the cell to remote
+
              call compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,fxyzu,fext,xyzcache,rad)
 
-             stack_redo%cells(cell%waiting_index) = cell
+             call write_cell(stack_redo,cell)
           else
              call store_results(icall,cell,getdv,getdB,realviscosity,stressmax,xyzh,gradh,divcurlv, &
                   divcurlB,alphaind,dvdx,vxyzu, &
@@ -516,36 +515,44 @@ subroutine densityiterate(icall,npart,nactive,xyzh,vxyzu,divcurlv,divcurlB,Bevol
           endif
 
        enddo over_waiting
-!$omp enddo
-!$omp barrier
-!$omp single
-       ! reset stacks
-       stack_waiting%n = 0
-       call check_send_finished(stack_remote,irequestsend,irequestrecv,xrecvbuf)
-!$omp end single
-    endif iam_waiting
-!$omp barrier
-!$omp single
-    call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,irequestsend)
-!$omp end single
+       !$omp enddo
 
-!$omp single
+       !$omp master
+       stack_waiting%n = 0
+       !$omp end master
+
+       idone(:) = .false.
+       do while(.not.all(idone))
+          call check_send_finished(irequestsend,idone)
+          call recv_cells(stack_remote,xrecvbuf,irequestrecv,cell_counters)
+       enddo
+    endif iam_waiting
+
+    if (mpi) call recv_while_wait(stack_remote,xrecvbuf,irequestrecv,&
+             irequestsend,thread_complete,cell_counters,ncomplete_mpi)
+
+    !$omp master
     if (reduceall_mpi('max',stack_redo%n) > 0) then
        call swap_stacks(stack_waiting, stack_redo)
     else
        iterations_finished = .true.
     endif
     stack_redo%n = 0
-!$omp end single
+    !$omp end master
+    !$omp barrier
 
  enddo remote_its
 
-#endif
-!$omp end parallel
-#ifdef MPI
- call finish_cell_exchange(irequestrecv,xsendbuf)
- call sync_hmax_mpi
-#endif
+ !$omp master
+ call get_timings(t2,tcpu2)
+ call increment_timer(itimer_dens_remote,t2-t1,tcpu2-tcpu1)
+ !$omp end master
+
+ if (mpi) call finish_cell_exchange(irequestrecv,xsendbuf,mpitype)
+
+ !$omp end parallel
+
+ if (mpi) call sync_hmax_mpi
 
  if (calculate_density) then
     !--reduce values
@@ -592,6 +599,7 @@ pure subroutine get_density_sums(i,xpartveci,hi,hi1,hi21,iamtypei,iamgasi,iamdus
  use kernel,   only:get_kernel,get_kernel_grav1
  use part,     only:iphase,iamgas,iamdust,iamtype,maxphase,ibasetype,igas,idust,rhoh,massoftype,iradxi
  use dim,      only:ndivcurlv,gravity,maxp,nalpha,use_dust,do_radiation
+ use options,  only:implicit_radiation
  integer,      intent(in)    :: i
  real,         intent(in)    :: xpartveci(:)
  real(kind=8), intent(in)    :: hi,hi1,hi21
@@ -821,7 +829,7 @@ pure subroutine get_density_sums(i,xpartveci,hi,hi1,hi21,iamtypei,iamgasi,iamdus
                 rhosum(idBzdzi) = rhosum(idBzdzi) + dBz*runiz
              endif
 
-             if (do_radiation .and. gas_gas) then
+             if (do_radiation .and. gas_gas .and. .not. implicit_radiation) then
                 rhoi = rhoh(real(hi), massoftype(igas))
                 rhoj = rhoh(xyzh(4,j), massoftype(igas))
                 dradenij = rad(iradxi,j)*rhoj - xpartveci(iradxii)*rhoi
@@ -881,7 +889,6 @@ pure subroutine calculate_rmatrix_from_sums(rhosum,denom,rmatrix,idone)
  rmatrix(6) = rxxi*ryyi - rxyi*rxyi    ! zz
  idone = .true.
 
- return
 end subroutine calculate_rmatrix_from_sums
 
 !----------------------------------------------------------------
@@ -916,7 +923,7 @@ pure subroutine calculate_divcurlv_from_sums(rhosum,termnorm,divcurlvi,ndivcurlv
  !--time derivative of div v, needed for Cullen-Dehnen switch
  if (nalpha >= 2) then
     !--Divvdt For switch
-    if (use_exact_linear) then
+    if (use_exact_linear .and. abs(denom) > tiny(denom)) then
        ddenom = 1./denom
        call exactlinear(gradaxdx,gradaxdy,gradaxdz,rhosum(idaxdxi),rhosum(idaxdyi),rhosum(idaxdzi),rmatrix,ddenom)
        call exactlinear(gradaydx,gradaydy,gradaydz,rhosum(idaydxi),rhosum(idaydyi),rhosum(idaydzi),rmatrix,ddenom)
@@ -1159,23 +1166,16 @@ end subroutine reset_neighbour_stats
 !+
 !----------------------------------------------------------------
 subroutine reduce_and_print_neighbour_stats(np)
- use mpiutils, only:reduce_mpi,barrier_mpi
+ use mpiutils, only:reduce_mpi
  use io,       only:iprint,id,master,iverbose
  integer, intent(in) :: np
 
- call barrier_mpi()
- nptot = reduce_mpi('+',np)
- call barrier_mpi()
+ nptot       = reduce_mpi('+',np)
  nneightry   = reduce_mpi('+',nneightry)
- call barrier_mpi()
  nneighact   = reduce_mpi('+',nneighact)
- call barrier_mpi()
  maxneightry = reduce_mpi('max',maxneightry)
- call barrier_mpi()
  maxneighact = int(reduce_mpi('max',maxneighact))
- call barrier_mpi()
  nrelink     = int(reduce_mpi('+',nrelink))
- call barrier_mpi()
  ncalc       = reduce_mpi('+',ncalc)
 
  if (id==master .and. iverbose >= 2 .and. nptot > 0 .and. nneighact > 0) then
@@ -1195,9 +1195,8 @@ pure subroutine compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,
                              xyzcache,rad)
  use part,        only:get_partinfo,iamgas,igas,maxphase
  use viscosity,   only:irealvisc
-#ifdef MPI
  use io,          only:id
-#endif
+ use dim,         only:mpi
 
  type(celldens),  intent(inout)  :: cell
 
@@ -1242,15 +1241,8 @@ pure subroutine compute_cell(cell,listneigh,nneigh,getdv,getdB,Bevol,xyzh,vxyzu,
     hi31  = hi1*hi21
     hi41  = hi21*hi21
 
-#ifdef MPI
-    if (cell%owner == id) then
-       ignoreself = .true.
-    else
-       ignoreself = .false.
-    endif
-#else
-    ignoreself = .true.
-#endif
+    ignoreself = (cell%owner == id)
+
     call get_density_sums(lli,cell%xpartvec(:,i),hi,hi1,hi21,iamtypei,iamgasi,iamdusti,&
                           listneigh,nneigh,nneighi,dxcache,xyzcache,cell%rhosums(:,i),&
                           .true.,.false.,getdv,getdB,realviscosity,&
@@ -1496,7 +1488,7 @@ subroutine store_results(icall,cell,getdv,getdb,realviscosity,stressmax,xyzh,&
                        maxgradh,idust,ifluxx,ifluxz,ithick
  use io,          only:fatal,real4
  use dim,         only:maxp,ndivcurlv,ndivcurlB,nalpha,use_dust,do_radiation
- use options,     only:use_dustfrac
+ use options,     only:use_dustfrac,implicit_radiation
  use viscosity,   only:bulkvisc,shearparam
  use linklist,    only:set_hmaxcell
  use kernel,      only:radkern
@@ -1637,7 +1629,9 @@ subroutine store_results(icall,cell,getdv,getdb,realviscosity,stressmax,xyzh,&
           dvdx(:,lli) = real(dvdxi(:),kind=kind(dvdx))
        endif
 
-       if (do_radiation .and. iamgasi) radprop(ifluxx:ifluxz,lli) = cell%rhosums(iradfxi:iradfzi,i)*term
+       if (do_radiation .and. iamgasi .and. .not. implicit_radiation) then
+          radprop(ifluxx:ifluxz,lli) = cell%rhosums(iradfxi:iradfzi,i)*term
+       endif
     endif
 
     if (calculate_density) then

@@ -1,10 +1,10 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
-module balance
+module mpibalance
 !
 ! This module moves the particles onto their correct processor
 !
@@ -14,34 +14,163 @@ module balance
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: dim, io, mpi, mpiutils, part, timing
+! :Dependencies: allocutils, io, mpi, mpiutils, part, timing
 !
 #ifdef MPI
  use mpi
- use io,       only:id,nprocs
- use dim,      only:maxprocs
+ use io,       only:id
  use mpiutils, only:mpierr,status,MPI_DEFAULT_REAL,reduceall_mpi, &
                     comm_balance,comm_balancecount
  use part,     only:ipartbufsize
+#endif
+ use io,       only:nprocs
 
  implicit none
 
- integer :: npartnew,ncomplete
- integer, dimension(1), private :: irequestrecv,irequestsend
-
- real, dimension(ipartbufsize)  :: xsendbuf,xbuffer
+ public :: allocate_balance_arrays
+ public :: deallocate_balance_arrays
+ public :: balancedomains
 
  private
- public :: balancedomains
- public :: balance_init,balance_finish,send_part,recv_part
 
- integer(kind=8) :: ntot_start
-
- integer :: nsent(maxprocs),nexpect(maxprocs),nrecv(maxprocs)
- integer :: countrequest(maxprocs)
+#ifdef MPI
+ real,            dimension(ipartbufsize)  :: xsendbuf,xbuffer
+ integer,         dimension(1)             :: irequestrecv,irequestsend
+ integer(kind=8)                           :: ntot_start
+ integer                                   :: npartnew, ncomplete
+#endif
+ integer,allocatable :: nsent(:),nexpect(:),nrecv(:)
+ integer,allocatable :: countrequest(:)
 
 contains
 
+!----------------------------------------------------------------
+!+
+!  allocate memory
+!+
+!----------------------------------------------------------------
+subroutine allocate_balance_arrays()
+ use allocutils, only:allocate_array
+
+ call allocate_array('nsent',       nsent,       nprocs)
+ call allocate_array('nexpect',     nexpect,     nprocs)
+ call allocate_array('nrecv',       nrecv,       nprocs)
+ call allocate_array('countrequest',countrequest,nprocs)
+
+end subroutine allocate_balance_arrays
+
+!----------------------------------------------------------------
+!+
+!  deallocate memory
+!+
+!----------------------------------------------------------------
+subroutine deallocate_balance_arrays()
+
+ if (allocated(nsent       )) deallocate(nsent       )
+ if (allocated(nexpect     )) deallocate(nexpect     )
+ if (allocated(nrecv       )) deallocate(nrecv       )
+ if (allocated(countrequest)) deallocate(countrequest)
+
+end subroutine deallocate_balance_arrays
+
+!----------------------------------------------------------------
+!+
+!  routine which moves particles onto their correct processor
+!  (for any domain decomposition)
+!+
+!----------------------------------------------------------------
+subroutine balancedomains(npart)
+#ifndef MPI
+ integer, intent(inout) :: npart
+#else
+ use io,     only:id,master,iverbose,fatal
+ use part,   only:shuffle_part,count_dead_particles,ibelong,update_npartoftypetot
+ use timing, only:getused,printused
+ use mpiutils, only:barrier_mpi
+ integer, intent(inout) :: npart
+ integer :: i,newproc
+ integer(kind=8) :: ntot
+ real(kind=4) :: tstart
+ ! initialise to check for receives every 2 particles
+ ! note that this is saved across calls, so it remembers the previous value
+ integer :: check_interval=2
+ integer :: recv_gap
+ logical :: gotpart
+
+ ! Balance is only necessary when there are more than 1 MPI tasks
+ if (nprocs > 1) then
+
+    if (id==master .and. iverbose >= 3) call getused(tstart)
+    if (id==master .and. iverbose >= 5) print*,'starting balance',npart
+
+    call balance_init(npart)
+    ntot_start = reduceall_mpi('+',npart - count_dead_particles())
+
+    recv_gap = 0
+    do i=1,npart
+       !
+       !--attempt to receive a particle
+       !
+       if (mod(i,check_interval) == 0) then
+          call recv_part(gotpart)
+          !
+          !--if there is a long gap between receiving particles, then decrease
+          !  the check frequency. if there is no gap, then increase frequency.
+          !  the frequency should roughly match the rate that particles are
+          !  available to be received.
+          !
+          if (gotpart) then
+             ! Halve period if 2 consecutive checks both return a particle
+             if (recv_gap == 0) check_interval = max(1, check_interval/2)
+             recv_gap = 0
+          else
+             recv_gap = recv_gap + 1
+             ! Double period if 4 consecutive checks do not return a particle
+             if (recv_gap > 4) then
+                check_interval = check_interval * 2
+                ! Half the gap counter to correspond to current frequency
+                recv_gap = recv_gap / 2
+             endif
+          endif
+       endif
+       !
+       !--send particles which belong to other processors
+       !
+       newproc = ibelong(i)
+       if (newproc /= id) call send_part(i,newproc)
+    enddo
+
+    if (iverbose >= 5) then
+       print*,id,' finished send, nsent = ',sum(nsent(1:nprocs)),' npart = ',npartnew
+       print*,id,' received so far ',sum(nrecv(1:nprocs))
+    endif
+    call balance_finish(npart)
+    ! ndead = count_dead_particles()
+    ! print*,' thread ',id,' before shuffle, got ',npart,' dead ',ndead,' actual = ',npart - ndead,ideadhead
+    call shuffle_part(npart)
+    call barrier_mpi()
+    ! ndead = count_dead_particles()
+    ! print*,' thread ',id,' after shuffle, got ',npart,' dead ',ndead,' actual = ',npart - ndead
+
+    ntot = reduceall_mpi('+',npart)
+    if (iverbose >= 4) print*,'>> shuffle: thread ',id,' got ',npart,' of ',ntot
+
+    if (ntot /= ntot_start) then
+       print*,id,'ntot',ntot
+       print*,id,'ntot_start',ntot_start
+       call fatal('balance','number of particles before and after balance not equal')
+    endif
+
+    !  Update particle types
+    call update_npartoftypetot
+
+    if (id==master .and. iverbose >= 3) call printused(tstart)
+
+ endif
+#endif
+end subroutine balancedomains
+
+#ifdef MPI
 !----------------------------------------------------------------
 !+
 !  initialisation of load balancing process,
@@ -49,16 +178,18 @@ contains
 !+
 !----------------------------------------------------------------
 subroutine balance_init(npart)
- implicit none
+ use part, only:fill_sendbuf
  integer, intent(in) :: npart
+ integer :: i,nbuf
 
- integer :: i
+ ! use a dummy call to fill_sendbuf to find out the buffer size
+ call fill_sendbuf(1,xbuffer,nbuf) ! just fill for particle #1
 
 !--use persistent communication type for receives
 !  cannot do same for sends as there are different destination,
 !  unless we make a request for each processor
 !
- call MPI_RECV_INIT(xbuffer,size(xbuffer),MPI_DEFAULT_REAL,MPI_ANY_SOURCE, &
+ call MPI_RECV_INIT(xbuffer,nbuf,MPI_DEFAULT_REAL,MPI_ANY_SOURCE, &
                     MPI_ANY_TAG,comm_balance,irequestrecv(1),mpierr)
 !
 !--post a non-blocking receive so that we can receive particles
@@ -85,69 +216,7 @@ subroutine balance_init(npart)
  !
  ncomplete = 0
 
- return
 end subroutine balance_init
-
-!----------------------------------------------------------------
-!+
-!  routine which moves particles onto their correct processor
-!  (for any domain decomposition)
-!+
-!----------------------------------------------------------------
-subroutine balancedomains(npart)
- use io,     only:id,master,iverbose,fatal
- use part,   only:shuffle_part,count_dead_particles,ibelong
- use timing, only:getused,printused
- use mpiutils, only:barrier_mpi
- implicit none
- integer, intent(inout) :: npart
- integer :: i,newproc
- integer(kind=8) :: ntot
- real(kind=4) :: tstart
-
- if (id==master .and. iverbose >= 3) call getused(tstart)
- if (id==master .and. iverbose >= 5) print*,'starting balance',npart
-
- call balance_init(npart)
- ntot_start = reduceall_mpi('+',npart - count_dead_particles())
-
- do i=1,npart
-!
-!--attempt to receive particles
-!
-    call recv_part()
-!
-!--send particles which belong to other processors
-!
-    newproc = ibelong(i)
-    if (newproc /= id) call send_part(i,newproc)
-
- enddo
-
- if (iverbose >= 5) then
-    print*,id,' finished send, nsent = ',sum(nsent(1:nprocs)),' npart = ',npartnew
-    print*,id,' received so far ',sum(nrecv(1:nprocs))
- endif
- call balance_finish(npart)
- ! ndead = count_dead_particles()
- ! print*,' thread ',id,' before shuffle, got ',npart,' dead ',ndead,' actual = ',npart - ndead,ideadhead
- call shuffle_part(npart)
- call barrier_mpi()
- ! ndead = count_dead_particles()
- ! print*,' thread ',id,' after shuffle, got ',npart,' dead ',ndead,' actual = ',npart - ndead
-
- ntot = reduceall_mpi('+',npart)
- if (iverbose >= 4) print*,'>> shuffle: thread ',id,' got ',npart,' of ',ntot
-
- if (ntot /= ntot_start) then
-    print*,id,'ntot',ntot
-    print*,id,'ntot_start',ntot_start
-    call fatal('balance','number of particles before and after balance not equal')
- endif
- if (id==master .and. iverbose >= 3) call printused(tstart)
-
- return
-end subroutine balancedomains
 
 !-----------------------------------------------------------------------
 !+
@@ -157,21 +226,21 @@ end subroutine balancedomains
 !  simply add new particles to the end of the array.
 !+
 !-----------------------------------------------------------------------
-subroutine recv_part(replace)
+subroutine recv_part(replace,gotpart)
  use io,      only:fatal,id
  use part,    only:isdead,unfill_buffer,maxp,ll,ideadhead,ibelong
- implicit none
- logical, intent(in), optional :: replace
+ logical, intent(in),  optional :: replace
+ logical, intent(out), optional :: gotpart
  logical :: igotpart
  integer :: inew
 
  igotpart = .false.
  call MPI_TEST(irequestrecv(1),igotpart,status,mpierr)
 
+ if (present(gotpart)) gotpart = igotpart
+
  if (igotpart) then
-!$omp critical
     nrecv(status(MPI_SOURCE)+1) = nrecv(status(MPI_SOURCE)+1) + 1
-!$omp end critical
     if (present(replace)) then
        if (replace) then
           inew = ideadhead
@@ -193,17 +262,13 @@ subroutine recv_part(replace)
        !--assume that this particle landed in the right place
        !
        ibelong(inew) = id
-!$omp critical
        ideadhead = ll(inew)
-!$omp end critical
     else
        if (inew /= 0) call fatal('balance','error in dead particle list',inew)
        !
        !--make a new particle
        !
-!$omp critical
        npartnew = npartnew + 1
-!$omp end critical
        if (npartnew > maxp) call fatal('recv_part','npartnew > maxp',npartnew)
        call unfill_buffer(npartnew,xbuffer)
        ibelong(npartnew) = id
@@ -223,12 +288,12 @@ end subroutine recv_part
 !+
 !-----------------------------------------------------------------------
 subroutine send_part(i,newproc,replace)
- use io,   only:fatal,nprocs
+ use io,   only:fatal
  use part, only:fill_sendbuf,kill_particle
- implicit none
  integer, intent(in) :: i,newproc
  logical, intent(in), optional :: replace
  logical :: idone,doreplace
+ integer :: nbuf
 
  if (present(replace)) then
     doreplace = replace
@@ -240,9 +305,9 @@ subroutine send_part(i,newproc,replace)
  if (newproc < 0 .or. newproc > nprocs-1) then
     call fatal('balance','error in ibelong',ival=newproc,var='ibelong')
  else
-    call fill_sendbuf(i,xsendbuf)
+    call fill_sendbuf(i,xsendbuf,nbuf)
     ! tag cannot be i, because some MPI implementations do not support large values for the tag
-    call MPI_ISEND(xsendbuf,size(xsendbuf),MPI_DEFAULT_REAL,newproc,0,comm_balance,irequestsend(1),mpierr)
+    call MPI_ISEND(xsendbuf,nbuf,MPI_DEFAULT_REAL,newproc,0,comm_balance,irequestsend(1),mpierr)
 
     !--wait for send to complete, receive whilst doing so
     idone = .false.
@@ -255,7 +320,7 @@ subroutine send_part(i,newproc,replace)
  call kill_particle(i)
 
  nsent(newproc+1) = nsent(newproc+1) + 1
- return
+
 end subroutine send_part
 
 !----------------------------------------------------------------
@@ -264,11 +329,10 @@ end subroutine send_part
 !+
 !----------------------------------------------------------------
 subroutine balance_finish(npart,replace)
- use io,  only:id,nprocs,fatal,iverbose
- implicit none
+ use io,    only:id,fatal,iverbose
+ use part,  only:recount_npartoftype
  integer, intent(out)            :: npart
  logical, intent(in), optional   :: replace
-
  integer             :: newproc
  integer             :: sendrequest !dummy
  logical, parameter  :: iamcomplete = .true.
@@ -315,6 +379,11 @@ subroutine balance_finish(npart,replace)
  call MPI_WAIT(irequestrecv(1),status,mpierr)
  call MPI_REQUEST_FREE(irequestrecv(1),mpierr)
 
+ !
+ !--update npartoftype
+ !
+ call recount_npartoftype
+
 end subroutine balance_finish
 
 subroutine check_complete
@@ -341,4 +410,4 @@ subroutine check_complete
 end subroutine check_complete
 #endif
 
-end module balance
+end module mpibalance

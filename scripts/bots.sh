@@ -15,18 +15,15 @@
 #
 # Written by Daniel Price 2014-
 #
+cd "${0%/*}"
 tmpdir="/tmp/";
 pwd=$PWD;
 phantomdir="$pwd/../";
-if [ ! -s $phantomdir/scripts/$0 ]; then
-   echo "Error: This script needs to be run from the phantom/scripts directory";
-   exit;
-fi
 scriptdir="$phantomdir/scripts";
 codedir="../";
 if [ ! -d $codedir ]; then
    echo "Error running bots: $codedir does not exist";
-   exit;
+   exit 100;
 fi
 headerfile="$scriptdir/HEADER-module";
 programfile="$scriptdir/HEADER-program";
@@ -43,12 +40,72 @@ if [ ! -s $codedir/$authorsfile ]; then
 fi
 docommit=0;
 applychanges=0;
-if [[ "$1" == "--apply" ]]; then
-   applychanges=1;
+doindent=1;
+gitstaged=0;
+input_file='';
+bot_names='';
+while [[ "$1" == --* ]]; do
+  case $1 in
+    --apply)
+      applychanges=1;
+      ;;
+
+    --commit)
+      docommit=1;
+      applychanges=1;
+      ;;
+
+    --no-indent)
+      doindent=0;
+      ;;
+
+   --staged-files-only)
+      gitstaged=1;
+      ;;
+
+   --file)
+      shift
+      input_file=$1;
+      break;
+      ;;
+
+   --files)
+      shift
+      input_files="$*";
+      break;
+      ;;
+
+    --only)
+      shift
+      bot_names=$1;
+      ;;
+
+    *)
+      badflag=$1
+      ;;
+  esac
+  shift
+done
+
+if [[ "$badflag" != "" ]]; then
+   echo "ERROR: Unknown flag $badflag"
+   exit
 fi
-if [[ "$1" == "--commit" ]]; then
-   docommit=1;
-   applychanges=1;
+
+if [[ $gitstaged == 1 && $docommit == 1 ]]; then
+   echo "--staged-files-only and --commit cannot both be used because "
+   echo "this will commit your git changes with the automated commit message"
+   exit
+fi
+
+if [[ $doindent == 1 ]]; then
+   if ! command -v findent > /dev/null; then
+      echo "ERROR: findent not found, please install:                   ";
+      echo "       https://www.ratrabbit.nl/ratrabbit/findent/index.html";
+      echo "                                                            ";
+      echo "       or disable indent-bot using --no-indent              ";
+      exit
+   fi
 fi
 cd $codedir;
 if [[ $docommit == 1 ]]; then
@@ -69,25 +126,64 @@ get_only_files_in_git()
    fi
 }
 allfiles='';
-bots_to_run='tabs gt shout header whitespace authors endif indent';
+bots_to_run='tabs gt shout header whitespace authors endif';
+if [[ $doindent == 1 ]]; then
+   bots_to_run="${bots_to_run} indent";
+fi
 #bots_to_run='shout';
+
+#
+# if --only flag is given, override list of bots_to_run
+#
+if [[ "$bot_names" != "" ]]; then
+   bots_to_run="${bot_names}"
+   echo ">> Running only ${bots_to_run} bots via --only flag"
+fi
+#
+# cycle over all the possible bots and run them...
+#
+modified=0
 for edittype in $bots_to_run; do
     filelist='';
     case $edittype in
     'authors' )
        dirlist=".";
        goback='-';
-       listoffiles="$authorsfile";;
+       filenamepattern="$authorsfile";;
     * )
        dirlist="src/*";
        goback="../../";
-       listoffiles="*.*90";;
+       filenamepattern="*.*90";;
     esac
     for dir in $dirlist; do
         if [ -d $dir ]; then
            cd $dir;
-           myfiles=`get_only_files_in_git "$listoffiles"`
+           if [[ $gitstaged == 1 && "$filenamepattern" == "*.*90" ]]; then
+             files=`git diff --name-only --cached --relative -- "./*.*90" | tr '\n' ' '`;
+           else
+             files=$filenamepattern
+           fi
+           if [[ "$input_file" != "" && "$edittype" != "authors" ]]; then
+           # Only process the input file
+             if [[ "$dir" == "$(dirname $input_file)" ]]; then
+               myfiles=$(basename $input_file)
+             else
+               myfiles=""
+             fi
+           elif [[ "$input_files" != "" ]]; then
+             # if using pre-commit to pass in a list of files, then there is no need to check
+             # if these files are in git
+             myfiles="$files"
+           else
+             myfiles=`get_only_files_in_git "$files"`
+           fi
            for file in $myfiles; do
+               if [[ "$input_files" != "" && "$input_files" != *"$dir/$file"* && "$edittype" != "authors" ]]; then
+                 continue
+               fi
+               if [[ "$file" == "libphantom-evolve.F90" ]]; then # skip as causes indent-bot trouble
+                  continue
+               fi
                out="$tmpdir/$file"
 #               echo "FILE=$file OUT=$out";
                case $edittype in
@@ -111,7 +207,7 @@ for edittype in $bots_to_run; do
                'shout' )
                  sed -e 's/SQRT(/sqrt(/g' \
                      -e 's/NINT(/nint(/g' \
-                     -e 's/STOP/stop/g' \
+                     -e 's/ STOP/ stop/g' \
                      -e 's/ATAN/atan/g' \
                      -e 's/ACOS(/acos(/g' \
                      -e 's/ASIN(/asin(/g' \
@@ -143,7 +239,29 @@ for edittype in $bots_to_run; do
                      -e 's/DOT_PRODUCT/dot_product/g' \
                      -e 's/ DIMENSION(/ dimension(/g' \
                      -e 's/CONTINUE/continue/g' \
+                     -e 's/KIND=/kind=/g' \
                      -e 's/ INTEGER/ integer/g' \
+                     -e 's/ PARAMETER/ parameter/g' \
+                     -e 's/INTENT(IN)/intent(in)/g' \
+                     -e 's/INTENT(OUT)/intent(out)/g' \
+                     -e 's/INTENT(INOUT)/intent(inout)/g' \
+                     -e 's/intent(IN)/intent(in)/g' \
+                     -e 's/intent(OUT)/intent(out)/g' \
+                     -e 's/intent(INOUT)/intent(inout)/g' \
+                     -e 's/INT(/int(/g' \
+                     -e 's/MIN(/min(/g' \
+                     -e 's/ABS(/abs(/g' \
+                     -e 's/NOT(/not(/g' \
+                     -e 's/IAND(/iand(/g' \
+                     -e 's/IEOR(/ieor(/g' \
+                     -e 's/MODULO(/modulo(/g' \
+                     -e 's/HUGE(/huge(/g' \
+                     -e 's/TINY(/tiny(/g' \
+                     -e 's/SELECTED_REAL_KIND(/selected_real_kind(/g' \
+                     -e 's/SELECTED_INT_KIND(/selected_int_kind(/g' \
+                     -e 's/SELECTED_REAL_kind(/selected_real_kind(/g' \
+                     -e 's/SELECTED_INT_kind(/selected_int_kind(/g' \
+                     -e 's/KIND(/kind(/g' \
                      -e 's/ REAL/ real/g' $file > $out;;
                'endif' )
                  sed -e 's/end if/endif/g' \
@@ -212,6 +330,7 @@ for edittype in $bots_to_run; do
           echo "$msg";
        fi
        echo "Modified files = $filelist";
+       modified=$((modified + 1))
     fi
     if [[ $docommit == 1 ]]; then
        git commit -m "$msg" $filelist;
@@ -232,3 +351,4 @@ else
       echo "No changes";
    fi
 fi
+exit $modified

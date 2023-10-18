@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module setup
 !
@@ -14,8 +14,8 @@ module setup
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: boundary, domain, io, mpiutils, part, physcon, prompting,
-!   setup_params, unifdis
+! :Dependencies: boundary, io, mpidomain, mpiutils, part, physcon,
+!   prompting, setup_params, unifdis
 !
  implicit none
  public :: setpart
@@ -38,8 +38,8 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  use mpiutils,     only:bcast_mpi
  use physcon,      only:pi
  use prompting,    only:prompt
- use domain,       only:i_belong
- use part,         only:periodic
+ use mpidomain,    only:i_belong
+ use part,         only:periodic,igas
  integer,           intent(in)    :: id
  integer,           intent(inout) :: npart
  integer,           intent(out)   :: npartoftype(:)
@@ -50,7 +50,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
  real,              intent(inout) :: time
  character(len=20), intent(in)    :: fileprefix
  real :: totmass,deltax,vzero,dz
- integer :: ipart,i,maxp,maxvxyzu,nx
+ integer :: i,maxp,maxvxyzu,nx
 !
 !--general parameters
 !
@@ -88,12 +88,12 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
                   hfact,npart,xyzh,periodic,nptot=npart_total,mask=i_belong)
 
  npartoftype(:) = 0
- npartoftype(1) = npart
- print*,' npart = ',ipart,npart,npart_total
+ npartoftype(igas) = npart
+ print*,' npart = ',npart,npart_total
 
  totmass = rhozero*dxbound*dybound*dzbound
  massoftype = totmass/npart_total
- print*,' particle mass = ',massoftype(1)
+ print*,' particle mass = ',massoftype(igas)
 
  vzero = 0.1
 

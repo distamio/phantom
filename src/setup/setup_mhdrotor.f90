@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module setup
 !
@@ -14,7 +14,7 @@ module setup
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: boundary, dim, domain, io, mpiutils, part, physcon,
+! :Dependencies: boundary, dim, io, mpidomain, mpiutils, part, physcon,
 !   prompting, setup_params, timestep, unifdis
 !
  implicit none
@@ -29,18 +29,20 @@ contains
 !  setup for uniform particle distributions
 !+
 !----------------------------------------------------------------
-subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,time,fileprefix)
+subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,&
+                   polyk,gamma,hfact,time,fileprefix)
  use dim,          only:maxp,maxvxyzu,mhd
  use setup_params, only:npart_total,ihavesetupB
  use io,           only:master
  use unifdis,      only:set_unifdis
- use boundary,     only:set_boundary,xmin,ymin,zmin,xmax,ymax,zmax,dxbound,dybound,dzbound
+ use boundary,     only:set_boundary,xmin,ymin,zmin,xmax,ymax,zmax,&
+                        dxbound,dybound,dzbound
  use mpiutils,     only:bcast_mpi
  use part,         only:igas,Bxyz,periodic
  use prompting,    only:prompt
  use physcon,      only:pi
  use timestep,     only:tmax,dtmax
- use domain,       only:i_belong
+ use mpidomain,    only:i_belong
  integer,           intent(in)    :: id
  integer,           intent(inout) :: npart
  integer,           intent(out)   :: npartoftype(:)
@@ -58,6 +60,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
 !
  time = 0.
  gamma = 1.4
+ polyk = 0.
 !
 !--set particles
 !
@@ -103,7 +106,7 @@ subroutine setpart(id,npart,npartoftype,xyzh,massoftype,vxyzu,polyk,gamma,hfact,
                   rcylmax=rdisk,mask=i_belong)
 
  npartoftype(:) = 0
- npartoftype(1) = npart
+ npartoftype(igas) = npart
  print*,' npart = ',npart,npart_total
 
  totvol = (dxbound*dybound - pi*rdisk**2)*dzbound

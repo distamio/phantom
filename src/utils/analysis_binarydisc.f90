@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module analysis
 !
@@ -482,7 +482,7 @@ end subroutine read_dotin
 !-----------------------------------------------------------------------
 subroutine get_binary_params(ipri,isec,xyzmh_ptmass,vxyz_ptmass,time,a,ecc,G)
 !-----------------------------------------------------------------------
- use io, only:fatal
+ use io, only:fatal,warning
 
  implicit none
 
@@ -516,7 +516,7 @@ subroutine get_binary_params(ipri,isec,xyzmh_ptmass,vxyz_ptmass,time,a,ecc,G)
  Lmag = sqrt(dot_product(L,L))
  E = 0.5*dot_product(dv,dv) - G*(mpri+msec)/rbin
 
- if (abs(E) < tiny(E)) stop 'binary energy problem'
+ if (abs(E) < tiny(E)) call warning(analysistype, 'E=0 for binary')
  call get_ae(Lmag,E,mpri,msec,a,ecc)
 
  if (time <= tiny(time)) then
@@ -548,7 +548,6 @@ subroutine get_ae(Lmag,E,m1,m2,a,ecc)
  real,intent(in) :: Lmag,E,m1,m2
 
  if (Lmag < tiny(Lmag)) stop 'Lmag is zero in get_ae'
- if (abs(E) < tiny(E)) stop 'E is zero in get_ae'
 
 ! Hence obtain the binary eccentricity
  ecc = sqrt(1.0 + (2.0*E*Lmag**2)/((m1+m2)**2))
@@ -603,9 +602,9 @@ subroutine get_utherm(ieos,xi,yi,zi,gamma,ui,csi)
 
  real :: rhoi = 1.0 ! this is essentially a dummy variable, not needed here
 !(only needed if adiabatic, but this routine is not called in that case...)
- real :: ponrhoi
+ real :: ponrhoi,tempi
 
- call equationofstate(ieos,ponrhoi,csi,rhoi,xi,yi,zi)
+ call equationofstate(ieos,ponrhoi,csi,rhoi,xi,yi,zi,tempi)
 
  if (gamma == 1.0) then
     ui = ponrhoi

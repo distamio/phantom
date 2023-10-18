@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module dim
 !
@@ -22,20 +22,18 @@ module dim
  integer, parameter, public :: phantom_version_minor = PHANTOM_VERSION_MINOR
  integer, parameter, public :: phantom_version_micro = PHANTOM_VERSION_MICRO
  character(len=*), parameter, public :: phantom_version_string = PHANTOM_VERSION_STRING
- character(len=80), parameter :: &  ! module version
-    modid="$Id$"
 
  public
 
  character(len=80), parameter :: &
-    tagline='Phantom v'//phantom_version_string//' (c) 2007-2020 The Authors'
+    tagline='Phantom v'//phantom_version_string//' (c) 2007-2023 The Authors'
 
  ! maximum number of particles
  integer :: maxp = 0 ! memory not allocated initially
 #ifdef MAXP
  integer, parameter :: maxp_hard = MAXP
 #else
- integer, parameter :: maxp_hard = 1200000
+ integer, parameter :: maxp_hard = 5200000
 #endif
 
  ! maximum number of point masses
@@ -44,21 +42,15 @@ module dim
 #else
  integer, parameter :: maxptmass = 1000
 #endif
- integer, parameter :: nsinkproperties = 17
+ integer, parameter :: nsinkproperties = 18
 
  ! storage of thermal energy or not
 #ifdef ISOTHERMAL
  integer, parameter :: maxvxyzu = 3
+ logical, parameter :: isothermal = .true.
 #else
  integer, parameter :: maxvxyzu = 4
-#endif
-
- ! storage of temperature
- integer :: maxtemp = 0
-#ifdef STORE_TEMPERATURE
- logical, parameter :: store_temperature = .true.
-#else
- logical, parameter :: store_temperature = .false.
+ logical, parameter :: isothermal = .false.
 #endif
 
  integer :: maxTdust = 0
@@ -77,7 +69,8 @@ module dim
 #endif
 
 ! maxmimum storage in linklist
- integer :: ncellsmax
+ integer         :: ncellsmax
+ integer(kind=8) :: ncellsmaxglobal
 
 !------
 ! Dust
@@ -135,7 +128,7 @@ module dim
                                    radensumden
 
  ! fsum
- integer, parameter :: fsumvars = 20 ! Number of scalars in fsum
+ integer, parameter :: fsumvars = 23 ! Number of scalars in fsum
  integer, parameter :: fsumarrs = 5  ! Number of arrays  in fsum
  integer, parameter :: maxfsum  = fsumvars + &                  ! Total number of values
                                   fsumarrs*(maxdusttypes-1) + &
@@ -144,7 +137,7 @@ module dim
 ! xpartveci
  integer, parameter :: maxxpartvecidens = 14 + radenxpartvetden
 
- integer, parameter :: maxxpartvecvars = 57 ! Number of scalars in xpartvec
+ integer, parameter :: maxxpartvecvars = 61 ! Number of scalars in xpartvec
  integer, parameter :: maxxpartvecarrs = 2  ! Number of arrays in xpartvec
  integer, parameter :: maxxpartvecGR   = 33 ! Number of GR values in xpartvec (1 for dens, 16 for gcov, 16 for gcon)
  integer, parameter :: maxxpartveciforce = maxxpartvecvars + &              ! Total number of values
@@ -152,21 +145,19 @@ module dim
                                            radenxpartvecforce + &
                                            maxxpartvecGR
 
- ! cell storage
- integer, parameter :: maxprocs = 32
-#ifdef STACKSIZE
- integer, parameter :: stacksize = STACKSIZE
+#ifdef MPI
+ logical, parameter :: mpi = .true.
 #else
- integer, parameter :: stacksize = 200000
+ logical, parameter :: mpi = .false.
 #endif
 
  ! storage for artificial viscosity switch
  integer :: maxalpha = 0
 #ifdef DISC_VISCOSITY
- integer, parameter :: nalpha = 1
+ integer, parameter :: nalpha = 0
 #else
 #ifdef CONST_AV
- integer, parameter :: nalpha = 1
+ integer, parameter :: nalpha = 0
 #else
 #ifdef USE_MORRIS_MONAGHAN
  integer, parameter :: nalpha = 1
@@ -213,9 +204,7 @@ module dim
  integer :: maxp_krome = 0
 #ifdef KROME
  logical, parameter :: use_krome = .true.
- logical, parameter :: store_gamma = .true.
 #else
- logical, parameter :: store_gamma = .false.
  logical, parameter :: use_krome = .false.
 #endif
 
@@ -287,22 +276,20 @@ module dim
  integer :: maxsts = 1
 
 !--------------------
-! Wind cooling
-!--------------------
-#if defined(WIND) || !defined (ISOTHERMAL)
- logical :: windcooling = .true.
-#else
- logical :: windcooling = .false.
-#endif
-
-!--------------------
 ! Dust formation
 !--------------------
-#ifdef NUCLEATION
- integer :: maxsp = maxp_hard
+ logical :: do_nucleation = .false.
+ integer :: itau_alloc    = 0
+ integer :: itauL_alloc   = 0
+ integer :: inucleation   = 0
+ !number of elements considered in the nucleation chemical network
+ integer, parameter :: nElements = 10
+#ifdef DUST_NUCLEATION
+ logical :: nucleation = .true.
 #else
- integer :: maxsp = 0
+ logical :: nucleation = .false.
 #endif
+ integer :: maxp_nucleation = 0
 
 !--------------------
 ! MCFOST library
@@ -327,9 +314,9 @@ module dim
 ! logical for bookkeeping
 !--------------------
 #ifdef INJECT_PARTICLES
- logical, parameter :: particles_are_injected = .true.
+ logical, parameter :: inject_parts = .true.
 #else
- logical, parameter :: particles_are_injected = .false.
+ logical, parameter :: inject_parts = .false.
 #endif
 
 !--------------------
@@ -348,6 +335,7 @@ module dim
  integer :: maxmhdan = 0
  integer :: maxdustan = 0
  integer :: maxgran = 0
+ integer :: maxindan = 0
 
  !--------------------
  ! Phase and gradh sizes - inconsistent with everything else, but keeping to original logic
@@ -355,10 +343,16 @@ module dim
  integer :: maxphase = 0
  integer :: maxgradh = 0
 
+ !--------------------
+ ! a place to store the number of the dumpfile; required for restart dumps
+ !--------------------
+ integer :: idumpfile = 0
+
 contains
 
-subroutine update_max_sizes(n)
- integer, intent(in) :: n
+subroutine update_max_sizes(n,ntot)
+ integer,                   intent(in) :: n
+ integer(kind=8), optional, intent(in) :: ntot
 
  maxp = n
 
@@ -367,17 +361,22 @@ subroutine update_max_sizes(n)
 #endif
 
 #ifdef SINK_RADIATION
- maxTdust = maxp
+ store_dust_temperature = .true.
 #endif
 
-#ifdef STORE_TEMPERATURE
- maxtemp = maxp
-#endif
+ if (store_dust_temperature) maxTdust = maxp
+ if (do_nucleation) maxp_nucleation = maxp
 
 #ifdef NCELLSMAX
- ncellsmax = NCELLSMAX
+ ncellsmax       = NCELLSMAX
+ ncellsmaxglobal = NCELLSMAX
 #else
  ncellsmax = 2*maxp
+ if (present(ntot)) then
+    ncellsmaxglobal = 2*ntot
+ else
+    ncellsmaxglobal = ncellsmax
+ endif
 #endif
 
 #ifdef DUST
@@ -437,8 +436,13 @@ subroutine update_max_sizes(n)
  maxgran = maxgr
 #endif
 
+#ifdef IND_TIMESTEPS
+ maxindan = maxan
+#endif
+
 #ifdef RADIATION
  maxprad = maxp
+ maxlum = maxp
 #endif
 ! Very convoluted, but follows original logic...
  maxphase = maxan

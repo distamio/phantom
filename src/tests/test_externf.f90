@@ -1,8 +1,8 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2021 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
-! http://phantomsph.bitbucket.io/                                          !
+! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
 module testexternf
 !
@@ -14,8 +14,8 @@ module testexternf
 !
 ! :Runtime parameters: None
 !
-! :Dependencies: domain, extern_corotate, externalforces, io, part,
-!   physcon, testutils, unifdis, units
+! :Dependencies: extern_corotate, externalforces, io, kernel, mpidomain,
+!   part, physcon, testutils, unifdis, units
 !
  implicit none
  public :: test_externf
@@ -30,7 +30,7 @@ contains
 !----------------------------------------------------------
 subroutine test_externf(ntests,npass)
  use io,       only:id,master
- use part,     only:npart,xyzh,hfact,massoftype,igas,periodic
+ use part,     only:npart,xyzh,hfact,massoftype,igas,periodic,npartoftype
  use testutils,only:checkval,checkvalf,checkvalbuf_start,checkvalbuf,checkvalbuf_end,update_test_scores
  use externalforces, only:externalforcetype,externalforce,accrete_particles, &
                           was_accreted,iexternalforce_max,initialise_externalforces,&
@@ -42,7 +42,8 @@ subroutine test_externf(ntests,npass)
  use unifdis,  only:set_unifdis
  use units,    only:set_units
  use physcon,  only:pc,solarm
- use domain,   only:i_belong
+ use mpidomain,only:i_belong
+ use kernel,   only:hfact_default
  integer, intent(inout) :: ntests,npass
  integer                :: i,iextf,nfail1,ierr
  logical                :: dotest1,dotest2,dotest3,accreted
@@ -65,7 +66,7 @@ subroutine test_externf(ntests,npass)
 !
  xmini(:) = -100.
  xmaxi(:) = 100.
- hfact      = 1.2
+ hfact      = hfact_default
  accradius1 = 100.  ! should be >6 for Lense-Thirring to pass
  psep  = (xmaxi(1) - xmini(1))/10.
  npart = 0
@@ -74,6 +75,8 @@ subroutine test_externf(ntests,npass)
  !dhi   = 0.001*hfact*psep
  dhi   = 1.e-8*psep
  massoftype(igas) = 1./real(npart)
+ npartoftype(igas) = npart
+
 !
 !--Test 1: check that external force is the derivative of potential
 !
