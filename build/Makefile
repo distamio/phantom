@@ -69,7 +69,8 @@ CCFLAGS = -O5
 LIBCXX = -lstdc++
 #FPPFLAGS=
 LDFLAGS=
-LIBTOOL=ar rcs
+#LIBTOOL=ar rcs  CHANGED THIS
+LIBTOOL=libtool
 
 #----------------------------------------------------------------
 # here follows specific configuration options used
@@ -423,7 +424,8 @@ endif
 #
 ifeq ($(HDF5), yes)
 ifeq (X$(HDF5ROOT), X)
-    HDF5ROOT= /opt/local
+    HDF5_DIR=/opt/local
+    HDF5ROOT=/opt/local
 endif
 ifeq (X$(HDF5INCLUDE), X)
     HDF5INCLUDE= $(HDF5_DIR)/include
