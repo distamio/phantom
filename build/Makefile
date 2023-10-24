@@ -424,14 +424,14 @@ endif
 #
 ifeq ($(HDF5), yes)
 ifeq (X$(HDF5ROOT), X)
-    HDF5_DIR=/opt/local
-    HDF5ROOT=/opt/local
+    HDF5_DIR=/opt/local/include
+    HDF5ROOT=/opt/local/include
 endif
 ifeq (X$(HDF5INCLUDE), X)
-    HDF5INCLUDE= $(HDF5_DIR)/include
+    HDF5INCLUDE= $(HDF5_DIR)
 endif
 ifeq (X$(HDF5LIB), X)
-    HDF5LIB= $(HDF5_DIR)/lib
+    HDF5LIB= $(HDF5_DIR)
 endif
     FFLAGS+= -I$(HDF5INCLUDE)
     CCFLAGS+= -I$(HDF5INCLUDE)

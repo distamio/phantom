@@ -16,7 +16,6 @@ ifeq ($(SETUP), mydisc)
     MULTIRUNFILE= multirun.f90
     IND_TIMESTEPS=yes
     STORE_TEMP=yes
-    HDF5=yes
     #no capital 'YES'
 endif
 
