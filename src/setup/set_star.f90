@@ -1,6 +1,6 @@
 !--------------------------------------------------------------------------!
 ! The Phantom Smoothed Particle Hydrodynamics code, by Daniel Price et al. !
-! Copyright (c) 2007-2023 The Authors (see AUTHORS)                        !
+! Copyright (c) 2007-2024 The Authors (see AUTHORS)                        !
 ! See LICENCE file for usage and distribution conditions                   !
 ! http://phantomsph.github.io/                                             !
 !--------------------------------------------------------------------------!
@@ -413,6 +413,7 @@ subroutine set_defaults_given_profile(iprofile,filename,need_iso,ieos,mstar,poly
  integer, intent(inout) :: ieos
  real,    intent(inout) :: mstar,polyk
 
+ need_iso = 0
  select case(iprofile)
  case(ifromfile)
     ! Read the density profile from file (e.g. for neutron star)
@@ -699,11 +700,16 @@ subroutine read_options_star(star,need_iso,ieos,polyk,db,nerr,label)
  select case(star%iprofile)
  case(imesa)
     ! core softening options
+    call read_inopt(star%isinkcore,'isinkcore'//trim(c),db,errcount=nerr)
+
+    if (star%isinkcore) then
+       call read_inopt(lcore_lsun,'lcore'//trim(c),db,errcount=nerr,min=0.)
+       star%lcore = lcore_lsun*real(solarl/unit_luminosity)
+    endif
+
     call read_inopt(star%isoftcore,'isoftcore'//trim(c),db,errcount=nerr,min=0)
-    if (star%isoftcore==2) star%isofteningopt=3
 
     if (star%isoftcore <= 0) then ! sink particle core without softening
-       call read_inopt(star%isinkcore,'isinkcore'//trim(c),db,errcount=nerr)
        if (star%isinkcore) then
           call read_inopt(mcore_msun,'mcore'//trim(c),db,errcount=nerr,min=0.)
           star%mcore = mcore_msun*real(solarm/umass)
@@ -711,11 +717,13 @@ subroutine read_options_star(star,need_iso,ieos,polyk,db,nerr,label)
           star%hsoft = hsoft_rsun*real(solarr/udist)
        endif
     else
-       star%isinkcore = .true.
-       call read_inopt(star%input_profile,'input_profile'//trim(c),db,errcount=nerr)
        call read_inopt(star%outputfilename,'outputfilename'//trim(c),db,errcount=nerr)
-       if (star%isoftcore==1) call read_inopt(star%isofteningopt,'isofteningopt'//trim(c),&
-                                              db,errcount=nerr,min=0)
+       if (star%isoftcore==2) then
+          star%isofteningopt=3
+       elseif (star%isoftcore==1) then
+          call read_inopt(star%isofteningopt,'isofteningopt'//trim(c),db,errcount=nerr,min=0)
+       endif
+
        if ((star%isofteningopt==1) .or. (star%isofteningopt==3)) then
           call read_inopt(rcore_rsun,'rcore'//trim(c),db,errcount=nerr,min=0.)
           star%rcore = rcore_rsun*real(solarr/udist)
@@ -725,8 +733,6 @@ subroutine read_options_star(star,need_iso,ieos,polyk,db,nerr,label)
           call read_inopt(mcore_msun,'mcore'//trim(c),db,errcount=nerr,min=0.)
           star%mcore = mcore_msun*real(solarm/umass)
        endif
-       call read_inopt(lcore_lsun,'lcore'//trim(c),db,errcount=nerr,min=0.)
-       star%lcore = lcore_lsun*real(solarl/unit_luminosity)
     endif
  case(ievrard)
     call read_inopt(star%ui_coef,'ui_coef'//trim(c),db,errcount=nerr,min=0.)
