@@ -16,6 +16,7 @@ ifeq ($(SETUP), mydisc)
     MULTIRUNFILE= multirun.f90
     IND_TIMESTEPS=yes
     STORE_TEMP=yes
+    MODFILE=moddump_centre.f90
     #no capital 'YES'
 endif
 
@@ -682,7 +683,7 @@ ifeq ($(SETUP), balsarakim)
     H2CHEM=yes
 endif
 
-ifeq ($(SETUP), mhdvortex)
+ifeq ($(SETUP), mhdvortex)SETUP=mydisc SYSTEM=gfortranOS
 #   Balsara (2004) MHD vortex
     PERIODIC=yes
     SETUPFILE= setup_mhdvortex.f90
